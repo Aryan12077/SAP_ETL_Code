@@ -1,0 +1,16 @@
+# Environment and secrets
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime progress files
+orchestrator_progress*.json
