@@ -83,7 +83,7 @@ LOOP_END:   date = date(2026, 9, 30)
 
 # Company codes — processed one at a time, each running all 78 periods
 COMPANY_CODES: List[str] = [
-    "1100", "3100"
+    "1100"
 ]
 
 # PostgreSQL stored procedure called after every (company + period) batch

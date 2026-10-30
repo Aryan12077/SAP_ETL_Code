@@ -1,0 +1,222 @@
+WITH CTE_BATCH AS (
+    SELECT
+        matnr,
+        werks,
+        lgort,
+        /* Representative batch / segment (lowest CHARG per sloc) */
+        MIN(charg)                                  AS charg,
+        MIN(sgt_scat)                               AS sgt_scat,
+        /* Aggregated batch-level unrestricted stock */
+        SUM(
+            CAST(NULLIF(clabs, '') AS NUMERIC(18,3))
+        )                                           AS clabs_total,
+        COUNT(DISTINCT charg)                       AS batch_count
+    FROM "sap_stg_hana"."stg_sap_mb52_mchb"
+    GROUP BY matnr, werks, lgort
+),
+
+/* ──────────────────────────────────────────────────────────────
+   STEP 2  —  CTE: Latest GR per material + plant + sloc
+   MSEG (BWART='101') is joined to MKPF on the inventory date.
+   We take the most recent posting per (MATNR, WERKS, LGORT):
+   the GR document date and the sign-corrected quantity received.
+   ────────────────────────────────────────────────────────────── */
+CTE_GR AS (
+    SELECT
+        sg.matnr,
+        sg.werks,
+        sg.lgort,
+        /* Latest GR posting date on the inventory date */
+        MAX(hd.budat)                               AS gr_budat,
+        /* Total GR quantity received on the inventory date (sign-corrected) */
+        SUM(
+            CASE sg.shkzg
+                WHEN 'H' THEN CAST(NULLIF(sg.menge, '') AS NUMERIC(18,3)) * -1
+                ELSE           CAST(NULLIF(sg.menge, '') AS NUMERIC(18,3))
+            END
+        )                                           AS gr_menge_signed,
+        /* Total GR value in local currency (sign-corrected) */
+        SUM(
+            CASE sg.shkzg
+                WHEN 'H' THEN CAST(NULLIF(sg.dmbtr, '') AS NUMERIC(18,2)) * -1
+                ELSE           CAST(NULLIF(sg.dmbtr, '') AS NUMERIC(18,2))
+            END
+        )                                           AS gr_dmbtr_signed,
+        COUNT(DISTINCT sg.mblnr)                    AS gr_doc_count
+    FROM "sap_stg_hana"."stg_sap_mb52_mseg"  sg
+    /* Join to header to apply the INVENTORY_DATE filter on BUDAT */
+    INNER JOIN "sap_stg_hana"."stg_sap_mb52_mkpf" hd
+        ON  hd.mblnr = sg.mblnr
+        AND hd.mjahr = sg.mjahr
+        AND hd.budat = '20260516'           -- ← replace with your INVENTORY_DATE
+    WHERE sg.bwart = '101'                  -- Goods Receipt only
+    GROUP BY sg.matnr, sg.werks, sg.lgort
+),
+
+/* ──────────────────────────────────────────────────────────────
+   STEP 3  —  CTE: Valuation area resolution
+   T001W.BWKEY → T001K (valuation area to company code)
+   → T001 (company master: name, currency).
+   Pre-joining these three small config tables avoids a
+   multi-join fan-out in the main query.
+   ────────────────────────────────────────────────────────────── */
+CTE_COMPANY AS (
+    SELECT
+        pw.werks,
+        pw.bwkey,
+        pk.bukrs,
+        co.butxt                                    AS company_name,
+        co.waers                                    AS currency
+    FROM      "sap_stg_hana"."stg_sap_mb52_t001w"  pw
+    LEFT JOIN "sap_stg_hana"."stg_sap_mb52_t001k"  pk
+        ON  pk.bwkey = pw.bwkey
+    LEFT JOIN "sap_stg_hana"."stg_sap_mb52_t001"   co
+        ON  co.bukrs = pk.bukrs
+),
+
+/* ──────────────────────────────────────────────────────────────
+   STEP 4  —  CTE: Material valuation
+   MBEW is keyed on (MATNR, BWKEY).  Join via BWKEY from CTE_COMPANY.
+   We pick the standard price (STPRS), inventory value (SALK3),
+   and price control indicator (VPRSV).
+   ────────────────────────────────────────────────────────────── */
+CTE_VALUATION AS (
+    SELECT
+        mv.matnr,
+        mv.bwkey,
+        mv.vprsv                                    AS price_control,
+        mv.bwtar                                    AS valuation_type,
+        CAST(NULLIF(mv.stprs, '') AS NUMERIC(18,4)) AS stprs,
+        CAST(NULLIF(mv.verpr, '') AS NUMERIC(18,4)) AS verpr,
+        CAST(NULLIF(mv.peinh, '') AS NUMERIC(18,3)) AS peinh,
+        CAST(NULLIF(mv.salk3, '') AS NUMERIC(18,2)) AS salk3,
+        CAST(NULLIF(mv.lbkum, '') AS NUMERIC(18,3)) AS lbkum
+    FROM "sap_stg_hana"."stg_sap_mb52_mbew" mv
+)
+
+/* ──────────────────────────────────────────────────────────────
+   MAIN SELECT — MB52 Inventory Analytics Columns
+   Grain: one row per Material + Plant + Storage Location
+   ────────────────────────────────────────────────────────────── */
+SELECT
+
+    /* ── Snapshot Metadata ──────────────────────────────────── */
+    md.inventory_dt                                 AS "Inventory Date",
+
+    /* ── Company & Organisational Data ─────────────────────── */
+    cp.bukrs                                        AS "Company Code",
+    cp.company_name                                 AS "Company Name",
+    cp.currency                                     AS "Currency",
+    cp.bwkey                                        AS "Valuation Area",
+
+    /* ── Plant & Storage Location ───────────────────────────── */
+    md.werks                                        AS "Plant",
+    pw.name1                                        AS "Plant Name",
+    pw.land1                                        AS "Country",
+    pw.regio                                        AS "Region",
+    md.lgort                                        AS "Storage Location",
+
+    /* ── Material Identification ────────────────────────────── */
+    md.matnr                                        AS "Material",
+    ma.mtart                                        AS "Material Type",
+    ma.matkl                                        AS "Material Group",
+    ma.mbrsh                                        AS "Industry Sector",
+    ma.meins                                        AS "Base Unit of Measure",
+
+    /* ── Stock Quantities (MARD — unrestricted grain) ───────── */
+    CAST(NULLIF(md.labst,  '') AS NUMERIC(18,3))    AS "Unrestricted Stock",
+    CAST(NULLIF(md.einme,  '') AS NUMERIC(18,3))    AS "Stock in Quality Insp.",
+    CAST(NULLIF(md.insme,  '') AS NUMERIC(18,3))    AS "Restricted-Use Stock",
+    CAST(NULLIF(md.retme,  '') AS NUMERIC(18,3))    AS "Blocked Stock (Returns)",
+    CAST(NULLIF(md.vmlab,  '') AS NUMERIC(18,3))    AS "Prev. Period Unrestr. Stock",
+    CAST(NULLIF(md.umlme,  '') AS NUMERIC(18,3))    AS "Stock in Transfer",
+    md.lfgja                                        AS "Fiscal Year (Last GR)",
+    md.lfmon                                        AS "Fiscal Month (Last GR)",
+
+    /* ── Batch Stock (aggregated from MCHB) ─────────────────── */
+    bt.charg                                        AS "Batch (Representative)",
+    bt.sgt_scat                                     AS "Stock Segment",
+    bt.clabs_total                                  AS "Batch Unrestricted Stock",
+    bt.batch_count                                  AS "Batch Count",
+
+    /* ── Valuation (MBEW) ────────────────────────────────────── */
+    vl.price_control                                AS "Price Control (V/S)",
+    vl.valuation_type                               AS "Valuation Type",
+    vl.stprs                                        AS "Standard Price (Per Piece)",
+    vl.verpr                                        AS "Moving Avg. Price",
+    vl.peinh                                        AS "Price Unit",
+    vl.salk3                                        AS "Inventory Value (Total)",
+    vl.lbkum                                        AS "Total Valuated Stock",
+
+    /* ── Calculated Value Fields ─────────────────────────────── */
+    /* Per-piece value: use STPRS for S-price, VERPR for V-price */
+    CASE vl.price_control
+        WHEN 'S' THEN vl.stprs
+        WHEN 'V' THEN vl.verpr
+        ELSE          COALESCE(vl.stprs, vl.verpr)
+    END                                             AS "Effective Per Piece Value",
+
+    /* Stock value at effective price × unrestricted qty */
+    ROUND(
+        CAST(NULLIF(md.labst, '') AS NUMERIC(18,3))
+        *
+        CASE vl.price_control
+            WHEN 'S' THEN vl.stprs
+            WHEN 'V' THEN vl.verpr
+            ELSE          COALESCE(vl.stprs, vl.verpr)
+        END
+    , 2)                                            AS "Calculated Stock Value",
+
+    /* ── Goods Receipt on Inventory Date (MSEG+MKPF) ────────── */
+    gr.gr_budat                                     AS "Purchase Date (GR)",
+    gr.gr_menge_signed                              AS "Purchase Quantity (GR)",
+    gr.gr_dmbtr_signed                              AS "GR Amount (LC)",
+    gr.gr_doc_count                                 AS "GR Document Count",
+
+    /* ── Material Physical Attributes (MARA) ─────────────────── */
+    CAST(NULLIF(ma.ntgew, '') AS NUMERIC(18,3))     AS "Net Weight",
+    CAST(NULLIF(ma.brgew, '') AS NUMERIC(18,3))     AS "Gross Weight",
+    ma.gewei                                        AS "Weight Unit",
+    ma.mfrpn                                        AS "Manufacturer Part No."
+
+FROM      "sap_stg_hana"."stg_sap_mb52_mard"   md
+
+/* ── Plant master ───────────────────────────────────────────── */
+LEFT JOIN "sap_stg_hana"."stg_sap_mb52_t001w"  pw
+    ON  pw.werks = md.werks
+
+/* ── Company / currency (via valuation area) ─────────────────  */
+LEFT JOIN CTE_COMPANY                           cp
+    ON  cp.werks = md.werks
+
+/* ── Material master ─────────────────────────────────────────── */
+LEFT JOIN "sap_stg_hana"."stg_sap_mb52_mara"   ma
+    ON  ma.matnr = md.matnr
+
+/* ── Batch stock (aggregated) ───────────────────────────────── */
+LEFT JOIN CTE_BATCH                             bt
+    ON  bt.matnr = md.matnr
+    AND bt.werks  = md.werks
+    AND bt.lgort  = md.lgort
+
+/* ── Valuation (MBEW keyed on MATNR + BWKEY) ───────────────── */
+LEFT JOIN CTE_VALUATION                         vl
+    ON  vl.matnr = md.matnr
+    AND vl.bwkey = cp.bwkey
+
+/* ── Goods receipt on inventory date ────────────────────────── */
+LEFT JOIN CTE_GR                                gr
+    ON  gr.matnr = md.matnr
+    AND gr.werks  = md.werks
+    AND gr.lgort  = md.lgort
+
+/* ── Filter: only rows with stock or GR activity ────────────── */
+WHERE (
+    CAST(NULLIF(md.labst, '') AS NUMERIC(18,3)) > 0
+    OR gr.gr_menge_signed IS NOT NULL
+)
+
+ORDER BY
+    md.werks    ASC,
+    md.lgort    ASC,
+    md.matnr    ASC;

@@ -166,7 +166,7 @@ SAP_SYSTEM: str = "ECC"
 # CONFIGURATION — edit this section only
 # ─────────────────────────────────────────────────────────────
 
-INVENTORY_DATE: str = os.getenv("INVENTORY_DATE", "20260915")
+INVENTORY_DATE: str = os.getenv("INVENTORY_DATE")
 
 PLANT_LIST: List[str] = [
     p.strip() for p in os.getenv("PLANTS", "1202").split(",") if p.strip()

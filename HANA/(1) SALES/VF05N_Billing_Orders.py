@@ -109,8 +109,8 @@ SAP_SYSTEM: str = "HANA"
 # -------------------------------------------------------------
 
 # Billing date range applied to VBRK.FKDAT
-DATE_FROM = os.getenv("DATE_FROM", "20260901")
-DATE_TO   = os.getenv("DATE_TO",   "20260930")
+DATE_FROM = os.getenv("DATE_FROM")
+DATE_TO   = os.getenv("DATE_TO")
 
 # Company codes — applied to VBRK.BUKRS
 # Read from env var (comma-separated list), fallback to "2600"

@@ -1,3 +1,4 @@
+
 SELECT
     -- Purchase order and material details
     s2.ebeln             AS "PO NUMBER",
@@ -6,11 +7,20 @@ SELECT
     s2.poitemseq         AS "SEQ.NO",
     s2.matnr             AS "MATERIAL",
     s2.maktx             AS "DESCRIPTION",
-    s2.menge             AS "PO QTY.",
+
+    NULLIF(TRIM(s2.menge), '')::NUMERIC
+                           AS "PO QTY.",
+
     s2.meins             AS "UOM",
-    s2.weight            AS "WEIGHT",
+
+    NULLIF(TRIM(s2.weight), '')::NUMERIC
+                           AS "WEIGHT",
+
     s2.wt_uom            AS "WEIGHT UOM",
-    s2.volum             AS "VOLUME",
+
+    NULLIF(TRIM(s2.volum), '')::NUMERIC
+                           AS "VOLUME",
+
     s2.vol_uom           AS "VOLUME UOM",
     s2.inv_no            AS "INV NO.",
     s2.inv_date          AS "INV.DATE",
@@ -19,9 +29,15 @@ SELECT
     s1.container         AS "CONTAINER NO",
     s1.cont_type         AS "TYP",
     s1.cont_size         AS "SIZE",
-    s1.container_wt      AS "CONTAINER WEIGHT",
+
+    NULLIF(TRIM(s1.container_wt), '')::NUMERIC
+                           AS "CONTAINER WEIGHT",
+
     s1.wt_unit           AS "CONTAINER WEIGHT UOM",
-    s1.container_vol     AS "CONTAINER VOLUME",
+
+    NULLIF(TRIM(s1.container_vol), '')::NUMERIC
+                           AS "CONTAINER VOLUME",
+
     s1.vol_unit          AS "CONTAINER VOLUME UOM",
 
     -- Shipping details
@@ -84,11 +100,12 @@ LEFT JOIN LATERAL (
 ) AS req ON TRUE
 
 WHERE s2.active2 = 'X'
---AND h.aedat >= '20260101'
---AND h.aedat <  '20270101'
 
--- Optional filters: uncomment and supply values to match
--- a specific ABAP report execution.
+-- Optional date filter
+-- AND h.aedat >= '20260101'
+-- AND h.aedat <  '20270101'
+
+-- Optional filters
 -- AND s2.comp = 'YOUR_COMPANY_CODE'
 -- AND s2.ebeln = 'YOUR_PO_NUMBER'
 -- AND h.aedat BETWEEN '20260101' AND '20261231'
@@ -98,5 +115,4 @@ WHERE s2.active2 = 'X'
 ORDER BY
     s2.ebeln,
     s2.poitemseq,
-    s2.matnr
-
+    s2.matnr;
