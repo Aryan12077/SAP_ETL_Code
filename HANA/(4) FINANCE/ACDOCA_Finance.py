@@ -1,75 +1,66 @@
 """
-SAP FBL3N G/L Account Line Items — Staging Extractor
-=====================================================
-Extracts columns matching the FBL3N (G/L Account Line Items) transaction
-report from SAP ECC FI accounting tables and loads them into PostgreSQL
-staging tables.
+SAP S/4HANA ACDOCA — FBL1N / FBL3N / FBL5N Line Items Staging Extractor
+=======================================================================
+Extracts the Universal Journal (ACDOCA) columns needed to rebuild the three
+line-item reports from one table, plus the master data they join to, and
+loads them into PostgreSQL staging tables (schema from STAGING_SCHEMA_HANA).
 
-FBL3N Report Column → SAP Field Mapping
------------------------------------------
-St           (Item Status)               → Derived: BSIS rows = 'Open', BSAS rows = 'Cleared'
-Clrng doc.   (Clearing Document)         → BSIS/BSAS.AUGBL
-Company Code                             → BSIS/BSAS.BUKRS
-Reference    (Ref. Doc. Number)          → BSIS/BSAS.XBLNR
-Assignment                               → BSIS/BSAS.ZUONR
-DocumentNo   (Accounting Document)       → BSIS/BSAS.BELNR
-Type         (Document Type)             → BSIS/BSAS.BLART
-Doc. Date    (Document Date)             → BSIS/BSAS.BLDAT
-Pstng Date   (Posting Date)             → BSIS/BSAS.BUDAT
-PK           (Posting Key)              → BSIS/BSAS.BSCHL
-Amount in local cur.                     → BSIS/BSAS.DMBTR
-Cost Ctr     (Cost Center)              → BSIS/BSAS.KOSTL
-Profit Ctr                               → BSIS/BSAS.PRCTR
-Amount in doc. curr.                     → BSIS/BSAS.WRBTR
-Curr.        (Document Currency)         → BSIS/BSAS.WAERS
-Due net      (Net Due Date)             → BSIS/BSAS.ZFBDT
-Text         (Item Text)                → BSIS/BSAS.SGTXT
-Year         (Fiscal Year)              → BSIS/BSAS.GJAHR
-Year/month   (Fiscal Year + Period)     → Derived: GJAHR + MONAT
+  FBL1N  Vendor line items     → ACDOCA rows with KOART = 'K'
+  FBL3N  G/L account items     → ACDOCA rows with KOART IN ('S','M')
+  FBL5N  Customer line items   → ACDOCA rows with KOART = 'D'
 
-Source tables (extraction order):
-  Pass 1 — BSIS : G/L Secondary Index — Open Items (anchor).
-            Filtered by BUDAT date range + BUKRS company code.
-            Collects _BUKRS_SET for downstream T001 lookup.
-  Pass 2 — BSAS : G/L Secondary Index — Cleared Items.
-            Same BUDAT + BUKRS filter as BSIS.
-  Pass 3 — T001 : Company Code Master. Driven by _BUKRS_SET from BSIS/BSAS.
+All transformation (open/cleared status, report splits, amounts, dates,
+currency factors) is done in SQL on top of the staging tables.
 
-Anchor table concept (mirrors COOIS extractor pattern)
-------------------------------------------------------
-  BSIS is the anchor table. The probe attempts to extract BSIS using up to
-  four RFC-function × WHERE-syntax combinations. The first combination that
-  yields rows is locked in for all subsequent tables. No re-probing occurs.
+ECC field → ACDOCA field mapping (columns used by the three ECC scripts)
+------------------------------------------------------------------------
+  BUKRS → RBUKRS        HKONT → RACCT         MONAT → POPER (3 digits)
+  SHKZG → DRCRK         DMBTR → HSL (+RHCUR)   WRBTR/WAERS → WSL + RWCUR
+  KOSTL → RCNTR         GSBER → RBUSA          VBELN → AWREF (AWTYP='VBRK')
+  Same name in ACDOCA: BELNR, GJAHR, BUZEI, BUDAT, BLDAT, BLART, ZUONR,
+  BSCHL, SGTXT, LIFNR, KUNNR, UMSKZ, REBZG, REBZJ, MWSKZ, PRCTR, WERKS,
+  AUGDT, AUGBL.
 
-  Probe order:
-    1. BBP_RFC_READ_TABLE + IN  syntax
-    2. BBP_RFC_READ_TABLE + OR  syntax
-    3. RFC_READ_TABLE     + IN  syntax
-    4. RFC_READ_TABLE     + OR  syntax
+NOT in ACDOCA (not extracted by this script):
+  XBLNR                       → BKPF (document header)
+  ZFBDT, ZTERM, ZBD1T/2T/3T,
+  ZLSCH, ZLSPR                → BSEG  (ACDOCA.NETDT gives the net due date)
+  MWSTS, WMWST                → derive in SQL from tax lines (KTOSL)
 
-  The winning probe performs a FULL extraction of BSIS (not merely a row-
-  existence check), so no data is fetched twice.
+Source tables (extraction order)
+--------------------------------
+  Pass 1 — ACDOCA : anchor. Filtered by ledger (RLDNR), company code
+           (RBUKRS), account type (KOART), plant (WERKS, optional), posting
+           period <> 000 (excludes balance carry-forward) and BUDAT range.
+           Collects RBUKRS / LIFNR / KUNNR key sets.
+  Pass 2 — T001   : company codes seen in ACDOCA.
+  Pass 3 — LFA1   : vendors seen in ACDOCA.LIFNR   (key lists chunked).
+  Pass 4 — KNA1   : customers seen in ACDOCA.KUNNR (key lists chunked).
 
-Date filter
------------
-  BUDAT (posting date) is used to restrict extraction.
-  Set DATE_FROM / DATE_TO as YYYYMMDD strings (or env vars).
+Anchor probe (same as FBL3N / COOIS)
+------------------------------------
+  ACDOCA is extracted with up to four RFC-function × WHERE-syntax
+  combinations (BBP_RFC_READ_TABLE / RFC_READ_TABLE × IN / OR). The first
+  that returns rows is locked in for all later tables. If every probe fails
+  with an error, the run is reported as FAILED (exit code 1).
 
-Filters retained
-----------------
-  - BUDAT posting date range  (DATE_FROM / DATE_TO)
-  - BUKRS company code list   (COMPANY_CODES)
+Loading (same as FBL3N)
+-----------------------
+  Existing staging tables are never dropped: missing columns are added,
+  then the table is truncated — or, when PLANTS is set, only this run's
+  slice is deleted (ledger + company codes + account types + plants +
+  posting-date range for ACDOCA; the extracted keys for the master tables),
+  so plant-by-plant runs accumulate in the same tables.
 
-All other filters (G/L account, document type, open/cleared toggle) have
-been removed to keep WHERE clauses tight and extraction fast.
-
-Design note — Purchase Document (EBELN):
-  BSIS and BSAS are secondary index tables and do NOT carry EBELN.
-  EBELN lives in BSEG. To populate Purch.Doc. seen in FBL3N:
-    1. Extract BSIS/BSAS as below.
-    2. In SQL, build a distinct BELNR+GJAHR key set.
-    3. Run a targeted BSEG read keyed by BELNR IN (...), batching ~1 000
-       keys at a time, selecting only EBELN + KUNNR/LIFNR fields.
+Notes for the SQL layer
+-----------------------
+  * HSL / WSL are already SIGNED (credit = negative). Do not apply DRCRK
+    again.  RFC returns negatives with a TRAILING minus ("1234.56-").
+  * Amounts are in SAP internal format: apply the currency-decimal factor
+    (e.g. UGX/RWF × 100) per amount's own currency (HSL→RHCUR, WSL→RWCUR).
+  * Open item = AUGBL blank; cleared = AUGBL filled.
+  * BUZEI = '000' marks lines with no FI (BSEG) line item.
+  * LIFNR / KUNNR may also be filled on G/L lines — split reports by KOART.
 """
 
 from __future__ import annotations
@@ -77,30 +68,29 @@ from __future__ import annotations
 import csv
 import io
 import os
-import platform
-
-# -------------------------------------------------------------
-# PostgreSQL DLL handling (required for Python 3.8+ on Windows)
-# Replace the path below with your actual PostgreSQL bin path.
-# -------------------------------------------------------------
-pg_bin_path = r"C:\Program Files\PostgreSQL\18\bin"
-
-if platform.system() == "Windows":
-    if os.path.exists(pg_bin_path):
-        os.add_dll_directory(pg_bin_path)
-    os.add_dll_directory(os.getcwd())
-
-import logging
 import sys
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
-import psycopg2
-from psycopg2 import extras
-from dotenv import load_dotenv
-from pyrfc import (
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+for _p in (_THIS_DIR, os.path.dirname(_THIS_DIR), os.path.dirname(os.path.dirname(_THIS_DIR))):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
+# connections.py must be imported BEFORE pyrfc / psycopg2 (.env + DLL paths)
+from connections import (  # noqa: E402
+    get_postgres_connection,
+    get_postgres_schema,
+    get_sap_connection,
+)
+
+import logging  # noqa: E402
+import time  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple  # noqa: E402
+
+import psycopg2  # noqa: E402
+from psycopg2 import extras  # noqa: E402
+from pyrfc import (  # noqa: E402
     ABAPApplicationError,
     ABAPRuntimeError,
     CommunicationError,
@@ -108,36 +98,50 @@ from pyrfc import (
     LogonError,
 )
 
-# ---------------------------------------------------------------------------
-# RFC SDK registration
-# ---------------------------------------------------------------------------
-load_dotenv()
+SAP_SYSTEM: str = "HANA"
 
-RFC_SDK_PATH = os.getenv("RFC_SDK_PATH", r"C:\nwrfcsdk\lib")
-if os.path.isdir(RFC_SDK_PATH):
-    if sys.platform == "win32":
-        try:
-            os.add_dll_directory(RFC_SDK_PATH)
-        except AttributeError:
-            os.environ["PATH"] = RFC_SDK_PATH + ";" + os.environ.get("PATH", "")
-    else:
-        os.environ["PATH"] = RFC_SDK_PATH + ":" + os.environ.get("PATH", "")
+
+def _env_list(name: str, default: str = "") -> List[str]:
+    """Comma-separated env var → list of trimmed, non-empty values."""
+    return [v.strip() for v in (os.getenv(name) or default).split(",") if v.strip()]
+
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION — edit this section only
+# CONFIGURATION — set via .env (defaults shown)
 # ---------------------------------------------------------------------------
 
-# Posting date range applied to BSIS.BUDAT / BSAS.BUDAT  (format YYYYMMDD)
-# Leave DATE_FROM empty ("") to skip the lower date boundary.
-# Leave DATE_TO   empty ("") to skip the upper date boundary.
-DATE_FROM: str = os.getenv("DATE_FROM", "20260601")
-DATE_TO:   str = os.getenv("DATE_TO",   "20260629")
+# Posting date range applied to ACDOCA.BUDAT (YYYYMMDD). Empty = unbounded.
+DATE_FROM: str = os.getenv("DATE_FROM", "20261001")
+DATE_TO:   str = os.getenv("DATE_TO",   "20261015")
 
-# Company codes — applied to BUKRS.  Use [""] to match blank or all codes.
-COMPANY_CODES: List[str] = ["1200"]
+# Company codes on the HANA system (ACDOCA.RBUKRS). Verify — they may differ
+# from the ECC company codes.
 
-# Prefix used when naming staging tables: stg_sap_fbl3n_<TABLE>
-STAGING_PREFIX: str = os.getenv("STAGING_PREFIX", "FBL3N_v2")
+# COMPANY_CODES: List[str] = _env_list("HANA_COMPANY_CODES", "1100")
+
+# Leading ledger (FINSC_LEDGER). Every posting exists once per ledger, so
+# this filter is mandatory to avoid duplicated amounts.
+LEDGER: str = os.getenv("HANA_LEDGER", "0L")
+
+# Account types to extract (ACDOCA.KOART):
+#   K = vendor (FBL1N), D = customer (FBL5N), S = G/L, M = material (FBL3N).
+# Empty = no KOART filter (also brings asset 'A' and CO-only lines).
+ACCOUNT_TYPES: List[str] = _env_list("ACCOUNT_TYPES", "D,K,S,M")
+
+# Plant filter on ACDOCA.WERKS (optional). NOTE: vendor and customer lines
+# (KOART K/D) normally have no plant, so a plant-scoped run returns mainly
+# material-related G/L lines.
+# PLANTS: List[str] = _env_list("PLANTS")
+
+COMPANY_CODES: List[str] = ["1100"]
+PLANTS: List[str] = []
+
+# Staging table names: stg_sap_<prefix>_<table>  →  stg_sap_fin_acdoca, ...
+# (own env var so it does not collide with STAGING_PREFIX used by others)
+STAGING_PREFIX: str = os.getenv("ACDOCA_STAGING_PREFIX", "fin")
+
+# Max keys per RFC call for the master tables (LFA1 / KNA1 / T001).
+KEY_CHUNK_SIZE: int = int(os.getenv("KEY_CHUNK_SIZE", "500"))
 
 # RFC functions tried in order during the anchor-table probe.
 RFC_FUNCTION_PRIORITY: List[str] = [
@@ -148,11 +152,11 @@ RFC_FUNCTION_PRIORITY: List[str] = [
 # ---------------------------------------------------------------------------
 # Runtime state (populated during extraction; used as WHERE filters)
 # ---------------------------------------------------------------------------
-_BUKRS_SET: Set[str] = set()   # Company codes (BSIS/BSAS → T001)
+_BUKRS_SET: Set[str] = set()   # ACDOCA.RBUKRS → T001
+_LIFNR_SET: Set[str] = set()   # ACDOCA.LIFNR  → LFA1
+_KUNNR_SET: Set[str] = set()   # ACDOCA.KUNNR  → KNA1
 
-# Active WHERE-syntax mode.
-# True  → use IN ('a','b','c')
-# False → use field='a' OR field='b' OR ...
+# Active WHERE-syntax mode: True → IN (...), False → OR-chained =
 _USE_IN_OPERATOR: bool = True
 
 # Date partition overrides (set per-partition in extract_table)
@@ -183,248 +187,195 @@ def _format_options(where: str) -> List[Dict[str, str]]:
     return lines
 
 
-def _build_or_options(
-    field_name: str,
-    values: Set[str],
-    extra: str = "",
-) -> List[Dict[str, str]]:
+def _value_clause(field_name: str, values: List[str]) -> str:
+    """One field's filter in the active syntax: =, IN ( ... ) or ( ... OR ... )."""
+    vals = sorted(set(values))
+    if len(vals) == 1:
+        return f"{field_name} = '{vals[0]}'"
+    if _USE_IN_OPERATOR:
+        return f"{field_name} IN ( " + ", ".join(f"'{v}'" for v in vals) + " )"
+    return "( " + " OR ".join(f"{field_name} = '{v}'" for v in vals) + " )"
+
+
+def _build_acdoca_options() -> List[Dict[str, str]]:
     """
-    Build RFC OPTIONS rows using OR-chained = clauses, chunked to 72 chars.
-
-    Example:
-        ( BUKRS = '1200' OR BUKRS = '1300' )
-        AND WAERS = 'USD'
-    """
-    if not values:
-        rows: List[Dict[str, str]] = [{"TEXT": f"{field_name} = '__NO_MATCH__'"}]
-        if extra:
-            rows.append({"TEXT": f"AND {extra}"})
-        return rows
-
-    sorted_vals = sorted(values)
-    options: List[Dict[str, str]] = []
-    i = 0
-    first_group = True
-
-    while i < len(sorted_vals):
-        prefix = "( " if first_group else "OR ( "
-        row_parts: List[str] = []
-        row_len = len(prefix)
-
-        while i < len(sorted_vals):
-            clause = f"{field_name} = '{sorted_vals[i]}'"
-            sep_len = len(" OR ") if row_parts else 0
-            if row_parts and row_len + sep_len + len(clause) + 2 > 72:
-                break
-            row_parts.append(clause)
-            row_len += sep_len + len(clause)
-            i += 1
-
-        options.append({"TEXT": prefix + " OR ".join(row_parts) + " )"})
-        first_group = False
-
-    if extra:
-        options.append({"TEXT": f"AND {extra}"})
-
-    return options
-
-
-def _build_in_options(
-    field_name: str,
-    values: Set[str],
-    extra: str = "",
-) -> List[Dict[str, str]]:
-    """
-    Build RFC OPTIONS rows using IN (...) clauses, chunked to 72 chars.
-
-    Automatically falls back to OR-syntax when _USE_IN_OPERATOR is False.
-    """
-    if not _USE_IN_OPERATOR:
-        return _build_or_options(field_name, values, extra)
-
-    if not values:
-        rows: List[Dict[str, str]] = [{"TEXT": f"{field_name} = '__NO_MATCH__'"}]
-        if extra:
-            rows.append({"TEXT": f"AND {extra}"})
-        return rows
-
-    sorted_vals = sorted(values)
-    options: List[Dict[str, str]] = []
-    first_clause = True
-    i = 0
-
-    while i < len(sorted_vals):
-        prefix   = f"{field_name} IN (" if first_clause else f"OR {field_name} IN ("
-        max_fill = 72 - len(prefix) - 1
-        row_vals: List[str] = []
-        row_len = 0
-
-        while i < len(sorted_vals):
-            quoted = f"'{sorted_vals[i]}'"
-            need   = len(quoted) + (1 if row_vals else 0)
-            if row_vals and row_len + need > max_fill:
-                break
-            row_vals.append(quoted)
-            row_len += need
-            i += 1
-
-        options.append({"TEXT": prefix + ",".join(row_vals) + ")"})
-        first_clause = False
-
-    if extra:
-        options.append({"TEXT": f"AND {extra}"})
-
-    return options
-
-
-def _build_gl_line_item_options() -> List[Dict[str, str]]:
-    """
-    Build WHERE options for BSIS / BSAS.
-
-    Filters applied (all combined with AND):
-      - BUDAT >= DATE_FROM (if specified)
-      - BUDAT <= DATE_TO   (if specified)
-      - BUKRS IN / = (company code list)
-
-    Supports both IN and OR WHERE syntax.
-    Uses date partition overrides when set by extract_table.
+    WHERE options for ACDOCA (all combined with AND):
+      RLDNR = ledger, RBUKRS company codes, KOART account types (if set),
+      WERKS plants (if set), POPER <> '000', BUDAT range (partition-aware).
     """
     date_from = _DATE_OVERRIDE_FROM or DATE_FROM
     date_to   = _DATE_OVERRIDE_TO   or DATE_TO
 
-    if _USE_IN_OPERATOR:
-        # --- IN syntax ---
-        codes = ",".join(f"'{c}'" for c in COMPANY_CODES)
-        where = f"BUKRS IN ({codes})"
-        if date_from:
-            where += f" AND BUDAT GE '{date_from}'"
-        if date_to:
-            where += f" AND BUDAT LE '{date_to}'"
-        return _format_options(where)
-
-    # --- OR-chained syntax ---
-    options: List[Dict[str, str]] = []
-
-    code_clauses = " OR ".join(f"BUKRS = '{c}'" for c in COMPANY_CODES)
-    options.append({"TEXT": f"( {code_clauses} )"})
-
+    clauses = [f"RLDNR = '{LEDGER}'", _value_clause("RBUKRS", COMPANY_CODES)]
+    if ACCOUNT_TYPES:
+        clauses.append(_value_clause("KOART", ACCOUNT_TYPES))
+    if PLANTS:
+        clauses.append(_value_clause("WERKS", PLANTS))
+    clauses.append("POPER NE '000'")
     if date_from:
-        options.append({"TEXT": f"AND BUDAT GE '{date_from}'"})
+        clauses.append(f"BUDAT GE '{date_from}'")
     if date_to:
-        options.append({"TEXT": f"AND BUDAT LE '{date_to}'"})
+        clauses.append(f"BUDAT LE '{date_to}'")
+    return _format_options(" AND ".join(clauses))
 
-    return options
+
+def _key_options(field_name: str) -> Callable[[List[str]], List[Dict[str, str]]]:
+    """Options builder for one chunk of keys of a master table."""
+    return lambda keys: _format_options(_value_clause(field_name, keys))
 
 
 # ---------------------------------------------------------------------------
-# Common column list shared by BSIS and BSAS
+# Scoped-delete builders (used instead of TRUNCATE when PLANTS is set)
 # ---------------------------------------------------------------------------
-# IMPORTANT — BSIS and BSAS are SECONDARY INDEX tables. They store a limited
-# subset of BSEG fields for open-item-managed G/L accounts. Fields that exist
-# only in BSEG (e.g. AUGGJ, DMBE2, PROJK, FKBER, SEGMENT) are intentionally
-# excluded here to avoid FIELD_NOT_VALID RFC errors.
+def _acdoca_delete_scope() -> Optional[Tuple[str, List[Any]]]:
+    """Delete exactly the slice this run reloads, so other plants are kept."""
+    if not PLANTS:
+        return None
+    where  = ['"rldnr" = %s', '"rbukrs" = ANY(%s)', '"werks" = ANY(%s)']
+    params: List[Any] = [LEDGER, COMPANY_CODES, PLANTS]
+    if ACCOUNT_TYPES:
+        where.append('"koart" = ANY(%s)')
+        params.append(ACCOUNT_TYPES)
+    if DATE_FROM:
+        where.append('"budat" >= %s')
+        params.append(DATE_FROM)
+    if DATE_TO:
+        where.append('"budat" <= %s')
+        params.append(DATE_TO)
+    return " AND ".join(where), params
+
+
+def _key_delete_scope(column: str, set_name: str) -> Callable[[], Optional[Tuple[str, List[Any]]]]:
+    """Master tables in plant-scoped runs: replace only the keys seen now."""
+    def scope() -> Optional[Tuple[str, List[Any]]]:
+        if not PLANTS:
+            return None
+        keys = sorted(getattr(sys.modules[__name__], set_name))
+        return f'"{column}" = ANY(%s)', [keys]
+    return scope
+
+
 # ---------------------------------------------------------------------------
-_GL_LINE_ITEM_COLUMNS: List[str] = [
-    # --- FBL3N visible columns ---
-    "BUKRS",      # Company Code
-    "HKONT",      # G/L Account Number           (G/L Acct)
-    "BELNR",      # Accounting Document Number    (DocumentNo)
-    "GJAHR",      # Fiscal Year                  (Year)
-    "BUZEI",      # Line Item Number within Document
-    "MONAT",      # Fiscal Period                (for Year/month derivation)
-    "BUDAT",      # Posting Date                 (Pstng Date)
-    "BLDAT",      # Document Date                (Doc. Date)
-    "BLART",      # Document Type                (Type)
-    "XBLNR",      # Reference Document Number    (Reference)
-    "ZUONR",      # Assignment Number            (Assignment)
-    "BSCHL",      # Posting Key                  (PK)
-    "SHKZG",      # Debit/Credit Indicator       ('S'=Debit / 'H'=Credit)
-    "DMBTR",      # Amount in Local Currency     (Amount in local cur.)
-    "WRBTR",      # Amount in Document Currency  (Amount in doc. curr.)
-    "WAERS",      # Document Currency            (Curr. / LCurr)
-    "SGTXT",      # Item Text                    (Text)
-    "ZFBDT",      # Baseline Date                (Due net basis)
-    "KOSTL",      # Cost Center                  (Cost Ctr)
-    "PRCTR",      # Profit Center                (Profit Ctr)
-    # --- Additional confirmed BSIS/BSAS secondary index fields ---
-    "GSBER",      # Business Area
-    "MWSKZ",      # Tax Code
-    "AUGDT",      # Clearing Date               (blank in BSIS; populated in BSAS)
-    "AUGBL",      # Clearing Document Number    (blank in BSIS; populated in BSAS)
-    "MWSTS",      # Tax Amount in Local Currency
-    "WMWST",      # Tax Amount in Document Currency
+# ACDOCA column list — fields used by FBL1N + FBL3N + FBL5N that exist in
+# ACDOCA, plus the control fields the SQL layer needs.
+# ---------------------------------------------------------------------------
+_ACDOCA_COLUMNS: List[str] = [
+    # --- Keys & control ---
+    "RLDNR",       # Ledger                          (filter: leading ledger)
+    "RBUKRS",      # Company Code                    (ECC BUKRS)
+    "GJAHR",       # Fiscal Year
+    "BELNR",       # Accounting Document Number
+    "DOCLN",       # Ledger line item (6-char key)
+    "BUZEI",       # FI line item ('000' = no BSEG line)
+    "KOART",       # Account Type  K/D/S/M → FBL1N / FBL5N / FBL3N split
+    "BSTAT",       # Document Status
+    "AWTYP",       # Reference transaction (VBRK = billing document)
+    "AWREF",       # Reference document no.          (ECC VBELN when AWTYP=VBRK)
+    "XREVERSING",  # Item reverses another item
+    "XREVERSED",   # Item is reversed
+    # --- Accounts & partners ---
+    "RACCT",       # G/L Account                     (ECC HKONT)
+    "LIFNR",       # Vendor                          → LFA1
+    "KUNNR",       # Customer                        → KNA1
+    "UMSKZ",       # Special G/L Indicator
+    # --- Dates & periods ---
+    "BUDAT",       # Posting Date
+    "BLDAT",       # Document Date
+    "POPER",       # Posting Period                  (ECC MONAT, 3 digits)
+    "NETDT",       # Net Due Date                    (replaces ZFBDT + terms)
+    "AUGDT",       # Clearing Date
+    "AUGBL",       # Clearing Document               (blank = open item)
+    "AUGGJ",       # Clearing Fiscal Year
+    # --- Document attributes ---
+    "BLART",       # Document Type
+    "BSCHL",       # Posting Key
+    "ZUONR",       # Assignment
+    "SGTXT",       # Item Text
+    "REBZG",       # Invoice reference
+    "REBZJ",       # Invoice reference fiscal year
+    "MWSKZ",       # Tax Code
+    "KTOSL",       # Transaction Key (identifies tax lines)
+    "DRCRK",       # Debit/Credit Indicator          (ECC SHKZG)
+    "XOPVW",       # Open item managed account
+    # --- Amounts (signed) ---
+    "HSL",         # Amount in company code currency (ECC DMBTR)
+    "RHCUR",       # Company code currency
+    "WSL",         # Amount in transaction currency  (ECC WRBTR)
+    "RWCUR",       # Transaction currency            (ECC WAERS)
+    # --- Org ---
+    "RCNTR",       # Cost Center                     (ECC KOSTL)
+    "PRCTR",       # Profit Center
+    "RBUSA",       # Business Area                   (ECC GSBER)
+    "WERKS",       # Plant
 ]
 
 
 # ---------------------------------------------------------------------------
 # TABLE DEFINITIONS
 # ---------------------------------------------------------------------------
-#
-# Each entry drives one complete extract-and-load pipeline pass.
 # Keys:
-#   table           → SAP transparent table name
-#   description     → human-readable label (for logs)
-#   columns         → fields to read (subset of the table's columns)
-#   options_fn      → callable returning RFC OPTIONS rows (WHERE clause)
-#   primary_keys    → for documentation / future dedup logic
-#   key_out         → {SAP_COLUMN: "_GLOBAL_SET_NAME"} — populates runtime key sets
-#   is_anchor       → True on BSIS; triggers the RFC/syntax probe
-#   date_partitioned → True on BSIS/BSAS; enables date window partitioning
+#   table            → SAP table name
+#   description      → label for logs
+#   columns          → fields to read
+#   options_fn       → () → RFC OPTIONS rows                (anchor)
+#   key_filter       → (SAP field, "_SET_NAME") → chunked key extraction
+#   key_options_fn   → (keys chunk) → RFC OPTIONS rows      (key tables)
+#   delete_scope_fn  → () → (WHERE, params) | None  — scoped delete instead
+#                      of TRUNCATE when PLANTS is set
+#   key_out          → {SAP field: "_SET_NAME"} harvested from extracted rows
+#   is_anchor        → runs the RFC/syntax probe
+#   date_partitioned → splits the BUDAT range into DATE_PARTITIONS windows
 #
 STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
 
-    # ── PASS 1 ─ BSIS : Open G/L Line Items (anchor) ──────────────────────
-    # Filtered by BUDAT date range + BUKRS company code.
-    # Collects _BUKRS_SET to drive T001 in Pass 3.
-    # The anchor probe (four RFC/syntax combos) is run here; the winning
-    # combination is re-used for all subsequent tables.
+    # ── PASS 1 ─ ACDOCA : Universal Journal line items (anchor) ───────────
     {
-        "table": "BSIS",
-        "description": "G/L Account Open Line Items (BUDAT + BUKRS filter)",
-        "columns": _GL_LINE_ITEM_COLUMNS,
-        "options_fn": _build_gl_line_item_options,
-        "primary_keys": ["BUKRS", "HKONT", "BELNR", "GJAHR", "BUZEI"],
+        "table": "ACDOCA",
+        "description": "Universal Journal — FBL1N/FBL3N/FBL5N line items",
+        "columns": _ACDOCA_COLUMNS,
+        "options_fn": _build_acdoca_options,
+        "delete_scope_fn": _acdoca_delete_scope,
+        "primary_keys": ["RLDNR", "RBUKRS", "GJAHR", "BELNR", "DOCLN"],
         "key_out": {
-            "BUKRS": "_BUKRS_SET",
+            "RBUKRS": "_BUKRS_SET",
+            "LIFNR":  "_LIFNR_SET",
+            "KUNNR":  "_KUNNR_SET",
         },
         "is_anchor": True,
         "date_partitioned": True,
     },
 
-    # ── PASS 2 ─ BSAS : Cleared G/L Line Items ────────────────────────────
-    # Same BUDAT + BUKRS filter as BSIS.
-    # AUGDT and AUGBL will be populated here (clearing info).
-    # Uses the RFC function and WHERE syntax determined by the BSIS probe.
-    {
-        "table": "BSAS",
-        "description": "G/L Account Cleared Line Items (BUDAT + BUKRS filter)",
-        "columns": _GL_LINE_ITEM_COLUMNS,
-        "options_fn": _build_gl_line_item_options,
-        "primary_keys": ["BUKRS", "HKONT", "BELNR", "GJAHR", "BUZEI"],
-        "key_out": {
-            "BUKRS": "_BUKRS_SET",
-        },
-        "date_partitioned": True,
-    },
-
-    # ── PASS 3 ─ T001 : Company Code Master ───────────────────────────────
-    # Driven by _BUKRS_SET populated from BSIS + BSAS.
-    # Provides company name and local currency for reporting joins.
+    # ── PASS 2 ─ T001 : Company Code Master ───────────────────────────────
     {
         "table": "T001",
-        "description": "Company Code Master — codes seen in this G/L line item set",
-        "columns": [
-            "BUKRS",   # Company Code
-            "BUTXT",   # Company Name
-            "ORT01",   # City
-            "LAND1",   # Country
-            "WAERS",   # Local Currency Key
-            "KTOPL",   # Chart of Accounts
-            "PERIV",   # Fiscal Year Variant
-        ],
-        "options_fn": lambda: _build_in_options("BUKRS", _BUKRS_SET),
+        "description": "Company Code Master — codes seen in ACDOCA",
+        "columns": ["BUKRS", "BUTXT", "ORT01", "LAND1", "WAERS", "KTOPL", "PERIV"],
+        "key_filter": ("BUKRS", "_BUKRS_SET"),
+        "key_options_fn": _key_options("BUKRS"),
+        "delete_scope_fn": _key_delete_scope("bukrs", "_BUKRS_SET"),
         "primary_keys": ["BUKRS"],
-        "date_partitioned": False,
+    },
+
+    # ── PASS 3 ─ LFA1 : Vendor Master (as in FBL1N) ───────────────────────
+    {
+        "table": "LFA1",
+        "description": "Vendor Master — vendors seen in ACDOCA",
+        "columns": ["LIFNR", "NAME1", "NAME2", "ORT01", "LAND1", "STRAS", "PSTLZ", "KTOKK"],
+        "key_filter": ("LIFNR", "_LIFNR_SET"),
+        "key_options_fn": _key_options("LIFNR"),
+        "delete_scope_fn": _key_delete_scope("lifnr", "_LIFNR_SET"),
+        "primary_keys": ["LIFNR"],
+    },
+
+    # ── PASS 4 ─ KNA1 : Customer Master (as in FBL5N) ─────────────────────
+    {
+        "table": "KNA1",
+        "description": "Customer Master — customers seen in ACDOCA",
+        "columns": ["KUNNR", "NAME1", "NAME2", "ORT01", "LAND1", "KTOKD"],
+        "key_filter": ("KUNNR", "_KUNNR_SET"),
+        "key_options_fn": _key_options("KUNNR"),
+        "delete_scope_fn": _key_delete_scope("kunnr", "_KUNNR_SET"),
+        "primary_keys": ["KUNNR"],
     },
 ]
 
@@ -441,7 +392,7 @@ class ExtractionConfig:
     retry_delay_s:    float = field(default_factory=lambda: float(os.getenv("RETRY_DELAY_S",  "5")))
     # Commit every 100 000 rows (same as COOIS) to minimise PostgreSQL overhead.
     commit_every:     int   = field(default_factory=lambda: int(os.getenv("COMMIT_EVERY",     "100000")))
-    staging_schema:   str   = field(default_factory=lambda: os.getenv("STAGING_SCHEMA_ECC",   "sap_stg_ecc"))
+    staging_schema:   str   = field(default_factory=lambda: get_postgres_schema(SAP_SYSTEM))
     # Performance: UNLOGGED skips WAL writes; COPY is faster than INSERT VALUES.
     use_unlogged_tables: bool = field(default_factory=lambda: os.getenv("USE_UNLOGGED_TABLES", "True").lower() in ("true", "1", "yes"))
     use_copy_loader:     bool = field(default_factory=lambda: os.getenv("USE_COPY_LOADER",     "True").lower() in ("true", "1", "yes"))
@@ -465,9 +416,9 @@ class ExtractionConfig:
 def _build_logger(run_id: str) -> logging.Logger:
     log_dir  = os.getenv("LOG_DIR", "logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"sap_fbl3n_staging_{run_id}.log")
+    log_file = os.path.join(log_dir, f"sap_acdoca_staging_{run_id}.log")
 
-    log = logging.getLogger(f"sap_fbl3n_staging.{run_id}")
+    log = logging.getLogger(f"sap_acdoca_staging.{run_id}")
     log.setLevel(logging.DEBUG)
     log.handlers.clear()
 
@@ -492,37 +443,6 @@ def _build_logger(run_id: str) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# Environment / connection helpers
-# ---------------------------------------------------------------------------
-def _require_env(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
-        raise EnvironmentError(f"Required env var '{key}' is missing or empty.")
-    return val
-
-
-def build_sap_config() -> Dict[str, str]:
-    return {
-        "user":   _require_env("SAP_USER"),
-        "passwd": _require_env("SAP_PASSWORD"),
-        "ashost": _require_env("SAP_ASHOST"),
-        "sysnr":  _require_env("SAP_SYSNR"),
-        "client": _require_env("SAP_CLIENT"),
-        "lang":   os.getenv("SAP_LANG", "EN"),
-    }
-
-
-def build_pg_config() -> Dict[str, Any]:
-    return {
-        "host":     _require_env("PG_HOST"),
-        "port":     os.getenv("PG_PORT", "5432"),
-        "database": _require_env("PG_DATABASE"),
-        "user":     _require_env("PG_USER"),
-        "password": _require_env("PG_PASSWORD"),
-    }
-
-
-# ---------------------------------------------------------------------------
 # SAP connection wrapper — with RFC function fallback
 # ---------------------------------------------------------------------------
 class SAPConnection:
@@ -533,8 +453,8 @@ class SAPConnection:
     switch_rfc_function() to advance to the next candidate.
     """
 
-    def __init__(self, config: Dict[str, str], log: logging.Logger) -> None:
-        self._cfg      = config
+    def __init__(self, system: str, log: logging.Logger) -> None:
+        self._system   = system
         self._log      = log
         self._fn_index = 0
         self.conn: Optional[Connection] = None
@@ -558,8 +478,8 @@ class SAPConnection:
     def _connect(self) -> None:
         for attempt in range(1, 4):
             try:
-                self._log.info("Connecting to SAP (attempt %d/3)...", attempt)
-                self.conn = Connection(**self._cfg)
+                self._log.info("Connecting to SAP %s (attempt %d/3)...", self._system, attempt)
+                self.conn = get_sap_connection(self._system)
                 self._log.info("SAP connection established.")
                 return
             except LogonError:
@@ -858,14 +778,12 @@ class BatchExtractor:
 class PostgresLoader:
     def __init__(
         self,
-        cfg:          Dict[str, Any],
         schema:       str,
         prefix:       str,
         log:          logging.Logger,
         use_unlogged: bool = True,
         use_copy:     bool = True,
     ) -> None:
-        self._cfg          = cfg
         self._schema       = schema
         self._prefix       = prefix
         self._log          = log
@@ -877,7 +795,7 @@ class PostgresLoader:
     def connect(self) -> None:
         self._log.info("Connecting to PostgreSQL...")
         try:
-            self.conn = psycopg2.connect(**self._cfg)
+            self.conn = get_postgres_connection()
             self.cur  = self.conn.cursor()
             self._log.info("PostgreSQL connection established.")
         except Exception:
@@ -897,16 +815,76 @@ class PostgresLoader:
             self._log.warning("PostgreSQL connection check failed. Reconnecting...")
             self.connect()
 
-    def create_staging_table(self, sap_table: str, columns: List[str]) -> str:
+    def _table_exists(self, schema: str, table: str) -> bool:
+        self.cur.execute(
+            """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            (schema, table),
+        )
+        return self.cur.fetchone() is not None
+
+    def _add_missing_columns(self, stg_name: str, safe_cols: List[str]) -> None:
+        """Add any configured column that the existing staging table lacks (as TEXT)."""
+        self.cur.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            (self._schema, stg_name),
+        )
+        existing = {r[0] for r in self.cur.fetchall()}
+        for col in safe_cols:
+            if col not in existing:
+                self.cur.execute(
+                    f'ALTER TABLE "{self._schema}"."{stg_name}" ADD COLUMN "{col}" TEXT;'
+                )
+                self._log.warning(
+                    "Staging table %s.%s: added missing column \"%s\".",
+                    self._schema, stg_name, col,
+                )
+
+    def create_staging_table(
+        self,
+        sap_table:    str,
+        columns:      List[str],
+        delete_scope: Optional[Tuple[str, List[Any]]] = None,
+    ) -> str:
+        """
+        Create the staging table if missing. If it exists: add missing columns,
+        then delete only `delete_scope` (plant-scoped runs) or TRUNCATE.
+        """
         self._ensure_connection()
-        stg_name  = f"stg_sap_{self._prefix.lower()}_{sap_table.lower()}"
+        stg_name  = f"stg_sap_acdoca_{sap_table.lower()}"
         safe_cols = [c.replace("-", "_").replace("/", "_").lower() for c in columns]
         col_defs  = ",\n    ".join([f'"{c}" TEXT' for c in safe_cols])
         tbl_type  = "UNLOGGED TABLE" if self._use_unlogged else "TABLE"
 
         self.cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema};")
+
+        if self._table_exists(self._schema, stg_name):
+            self._add_missing_columns(stg_name, safe_cols)
+            if delete_scope is not None:
+                where, params = delete_scope
+                self.cur.execute(
+                    f'DELETE FROM "{self._schema}"."{stg_name}" WHERE {where}', params
+                )
+                deleted = self.cur.rowcount
+                self.conn.commit()
+                self._log.info(
+                    "Staging table %s.%s: deleted %d rows for this run's slice; "
+                    "rows outside it are kept.",
+                    self._schema, stg_name, deleted,
+                )
+                return f'"{self._schema}"."{stg_name}"'
+
+            self.cur.execute(f'TRUNCATE TABLE "{self._schema}"."{stg_name}";')
+            self.conn.commit()
+            self._log.info("Staging table %s.%s truncated.", self._schema, stg_name)
+            return f'"{self._schema}"."{stg_name}"'
+
         self.cur.execute(f"""
-        DROP TABLE IF EXISTS {self._schema}.{stg_name};
         CREATE {tbl_type} {self._schema}.{stg_name} (
             {col_defs},
             load_ts       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1049,35 +1027,63 @@ def extract_table(
     widths  = meta.get_widths(table, columns)
     chunker = ColumnChunker(columns, widths, cfg.max_buffer_width, log)
     chunks  = chunker.chunks()
-
-    stg_table = loader.create_staging_table(table, columns)
-
-    is_date_partitioned = table_def.get("date_partitioned", False)
-    if cfg.date_partitions > 1 and is_date_partitioned:
-        windows = _split_date_range(DATE_FROM, DATE_TO, cfg.date_partitions)
-        log.info(
-            "[%s] Date partitioning: %d window(s) over %s → %s",
-            table, len(windows), DATE_FROM, DATE_TO,
+    if len(chunks) > 1 and table_def.get("is_anchor"):
+        log.warning(
+            "[%s] Columns split into %d RFC calls per batch. Rows from separate "
+            "calls are matched by position, and HANA does not guarantee the same "
+            "row order between calls — check the DD03L width lookup above, and "
+            "keep the column list within MAX_BUFFER_WIDTH so it fits one call.",
+            table, len(chunks),
         )
+
+    scope_fn  = table_def.get("delete_scope_fn")
+    stg_table = loader.create_staging_table(
+        table, columns, scope_fn() if callable(scope_fn) else None
+    )
+
+    # Build the list of option sets to run: date windows (anchor) or key chunks.
+    option_sets: List[Tuple[str, List[Dict[str, str]]]] = []
+    key_filter = table_def.get("key_filter")
+
+    if key_filter:
+        field_name, set_name = key_filter
+        keys = sorted(getattr(sys.modules[__name__], set_name))
+        if not keys:
+            log.info("[%s] No %s keys collected — nothing to extract.", table, field_name)
+            loader.commit()
+            return True, 0
+        build = table_def["key_options_fn"]
+        n_chunks = (len(keys) + KEY_CHUNK_SIZE - 1) // KEY_CHUNK_SIZE
+        log.info("[%s] %d %s keys → %d chunk(s) of up to %d.",
+                 table, len(keys), field_name, n_chunks, KEY_CHUNK_SIZE)
+        for i in range(0, len(keys), KEY_CHUNK_SIZE):
+            option_sets.append((
+                f"key chunk {i // KEY_CHUNK_SIZE + 1}/{n_chunks}",
+                build(keys[i:i + KEY_CHUNK_SIZE]),
+            ))
     else:
-        windows = [("", "")]
+        if cfg.date_partitions > 1 and table_def.get("date_partitioned", False):
+            windows = _split_date_range(DATE_FROM, DATE_TO, cfg.date_partitions)
+            log.info("[%s] Date partitioning: %d window(s) over %s → %s",
+                     table, len(windows), DATE_FROM, DATE_TO)
+        else:
+            windows = [("", "")]
+        options_fn = table_def.get("options_fn")
+        for win_idx, (win_from, win_to) in enumerate(windows):
+            _DATE_OVERRIDE_FROM = win_from
+            _DATE_OVERRIDE_TO   = win_to
+            label = (f"partition {win_idx + 1}/{len(windows)}: {win_from} → {win_to}"
+                     if win_from and win_to else "full range")
+            option_sets.append((label, options_fn() if callable(options_fn) else []))
+        _DATE_OVERRIDE_FROM = ""
+        _DATE_OVERRIDE_TO   = ""
 
     rows_loaded       = 0
     rows_since_commit = 0
 
-    for win_idx, (win_from, win_to) in enumerate(windows):
-        _DATE_OVERRIDE_FROM = win_from
-        _DATE_OVERRIDE_TO   = win_to
-
-        if win_from and win_to:
-            log.info(
-                "[%s] Partition %d/%d: %s → %s",
-                table, win_idx + 1, len(windows), win_from, win_to,
-            )
-
-        options_fn = table_def.get("options_fn")
-        options    = options_fn() if callable(options_fn) else []
-
+    for label, options in option_sets:
+        if len(option_sets) > 1:
+            log.info("[%s] %s", table, label)
         if options:
             preview = " | ".join(r["TEXT"] for r in options[:4])
             suffix  = " | ..." if len(options) > 4 else ""
@@ -1100,21 +1106,21 @@ def extract_table(
 
     loader.commit()
 
-    _DATE_OVERRIDE_FROM = ""
-    _DATE_OVERRIDE_TO   = ""
-
     elapsed = time.time() - t0
     rate    = rows_loaded / elapsed if elapsed > 0 else 0
-    log.info(
-        "[%s] Done — %d rows in %.1fs (%.0f rows/s).",
-        table, rows_loaded, elapsed, rate,
-    )
+    log.info("[%s] Done — %d rows in %.1fs (%.0f rows/s).", table, rows_loaded, elapsed, rate)
     return True, rows_loaded
 
 
 # ---------------------------------------------------------------------------
 # Anchor-table probe: try all RFC fn × WHERE syntax combinations
 # ---------------------------------------------------------------------------
+def _clear_key_sets() -> None:
+    _BUKRS_SET.clear()
+    _LIFNR_SET.clear()
+    _KUNNR_SET.clear()
+
+
 def _probe_anchor_table(
     anchor_def: Dict[str, Any],
     sap:        SAPConnection,
@@ -1123,19 +1129,11 @@ def _probe_anchor_table(
     log:        logging.Logger,
 ) -> Tuple[bool, int]:
     """
-    Try to extract the anchor table (BSIS) using up to four combinations:
-
-        Probe 1  BBP_RFC_READ_TABLE + IN  syntax
-        Probe 2  BBP_RFC_READ_TABLE + OR  syntax
-        Probe 3  RFC_READ_TABLE     + IN  syntax
-        Probe 4  RFC_READ_TABLE     + OR  syntax
-
-    The probe IS the full extraction — no rows are fetched twice.
-    Stops as soon as a non-zero row count is achieved.
-    The winning RFC function and WHERE syntax are locked in for all
-    subsequent table extractions.
-
-    If all probes return 0 rows the filter criteria returned no data.
+    Extract the anchor table (ACDOCA) with up to four combinations:
+        1 BBP_RFC_READ_TABLE + IN   2 BBP_RFC_READ_TABLE + OR
+        3 RFC_READ_TABLE     + IN   4 RFC_READ_TABLE     + OR
+    The probe IS the full extraction. The winning RFC function and syntax
+    are locked in for all later tables. All probes raising → (False, 0).
     """
     global _USE_IN_OPERATOR
 
@@ -1145,6 +1143,8 @@ def _probe_anchor_table(
     for fn_idx in range(len(RFC_FUNCTION_PRIORITY)):
         attempts.append((True,  fn_idx))   # IN  syntax
         attempts.append((False, fn_idx))   # OR  syntax
+
+    probes_raised = 0
 
     for probe_num, (use_in, fn_idx) in enumerate(attempts, start=1):
         _USE_IN_OPERATOR = use_in
@@ -1156,19 +1156,25 @@ def _probe_anchor_table(
             probe_num, len(attempts), sap.rfc_function, syntax_label,
         )
 
-        # Clear anchor key set so a retry starts fresh.
-        _BUKRS_SET.clear()
+        _clear_key_sets()   # a retry starts fresh
 
         try:
             ok, count = extract_table(anchor_def, sap, loader, cfg, log)
         except Exception:
-            log.warning("Probe %d raised an exception — trying next combination.", probe_num)
+            probes_raised += 1
+            log.exception("Probe %d raised an exception — trying next combination.", probe_num)
+            # A failed SQL statement aborts the PostgreSQL transaction;
+            # roll back so the next probe (and later tables) can continue.
+            try:
+                if loader.conn is not None and not loader.conn.closed:
+                    loader.conn.rollback()
+            except Exception:
+                log.warning("PostgreSQL rollback after failed probe also failed.")
             continue
 
         if count > 0:
             log.info(
-                "✓ Anchor probe succeeded on attempt %d — "
-                "RFC=%s | syntax=%s | rows=%d",
+                "✓ Anchor probe succeeded on attempt %d — RFC=%s | syntax=%s | rows=%d",
                 probe_num, sap.rfc_function, syntax_label, count,
             )
             return ok, count
@@ -1178,11 +1184,19 @@ def _probe_anchor_table(
             probe_num, sap.rfc_function, syntax_label,
         )
 
+    if probes_raised == len(attempts):
+        log.error(
+            "All %d anchor probes FAILED with errors for %s (see tracebacks above). "
+            "This is an error, not an empty result.",
+            len(attempts), table,
+        )
+        return False, 0
+
     log.error(
-        "All %d anchor probes returned 0 rows for %s. "
-        "Verify company code(s) %s and date range %s–%s in SAP.",
-        len(attempts), table, COMPANY_CODES,
-        DATE_FROM or "unbounded", DATE_TO or "unbounded",
+        "All %d anchor probes returned 0 rows for %s. Verify ledger %s, company "
+        "code(s) %s, account types %s, plant(s) %s and date range %s–%s in SAP.",
+        len(attempts), table, LEDGER, COMPANY_CODES, ACCOUNT_TYPES or "ALL",
+        PLANTS or "ALL", DATE_FROM or "unbounded", DATE_TO or "unbounded",
     )
     return True, 0
 
@@ -1195,40 +1209,43 @@ def main() -> None:
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     log    = _build_logger(run_id)
+    _clear_key_sets()
 
     log.info("=" * 60)
-    log.info("SAP FBL3N G/L Account Line Items Staging Pipeline  [run: %s]", run_id)
+    log.info("SAP ACDOCA (FBL1N/FBL3N/FBL5N) Staging Pipeline  [run: %s]", run_id)
+    log.info("SAP system     : %s", SAP_SYSTEM)
+    log.info("Ledger         : %s", LEDGER)
     log.info("Company codes  : %s", COMPANY_CODES)
+    log.info("Account types  : %s", ACCOUNT_TYPES if ACCOUNT_TYPES else "ALL (no KOART filter)")
+    log.info("Plants         : %s", PLANTS if PLANTS else "ALL (no plant filter)")
     log.info("Date from      : %s", DATE_FROM if DATE_FROM else "unbounded")
     log.info("Date to        : %s", DATE_TO   if DATE_TO   else "unbounded")
-    log.info("Staging prefix : stg_sap_%s_<TABLE>", STAGING_PREFIX.lower())
+    log.info("Staging tables : stg_sap_%s_<TABLE>", STAGING_PREFIX.lower())
     log.info("Tables         : %d", len(STAGING_TABLE_DEFS))
     log.info("RFC priority   : %s", RFC_FUNCTION_PRIORITY)
     log.info("=" * 60)
 
+    if not COMPANY_CODES:
+        log.critical("No company codes configured (HANA_COMPANY_CODES) — aborting.")
+        sys.exit(1)
+
     try:
         cfg = ExtractionConfig()
-        sap_config = build_sap_config()
-        pg_config  = build_pg_config()
     except (EnvironmentError, ValueError) as exc:
         log.critical("Configuration error: %s", exc)
         sys.exit(1)
 
     _FAST_CLEAN_MODE = cfg.fast_clean_mode
 
-    log.info(
-        "Config: batch_size=%d  commit_every=%d  date_partitions=%d",
-        cfg.batch_size, cfg.commit_every, cfg.date_partitions,
-    )
-    log.info(
-        "Config: unlogged=%s  copy_loader=%s  fast_clean=%s",
-        cfg.use_unlogged_tables, cfg.use_copy_loader, cfg.fast_clean_mode,
-    )
+    log.info("Config: schema=%s  batch_size=%d  commit_every=%d  date_partitions=%d  key_chunk=%d",
+             cfg.staging_schema, cfg.batch_size, cfg.commit_every, cfg.date_partitions, KEY_CHUNK_SIZE)
+    log.info("Config: unlogged=%s  copy_loader=%s  fast_clean=%s",
+             cfg.use_unlogged_tables, cfg.use_copy_loader, cfg.fast_clean_mode)
 
     try:
-        sap    = SAPConnection(sap_config, log)
+        sap    = SAPConnection(SAP_SYSTEM, log)
         loader = PostgresLoader(
-            pg_config, cfg.staging_schema, STAGING_PREFIX, log,
+            cfg.staging_schema, STAGING_PREFIX, log,
             use_unlogged=cfg.use_unlogged_tables,
             use_copy=cfg.use_copy_loader,
         )
@@ -1249,11 +1266,10 @@ def main() -> None:
                     results[tbl_name] = (ok, count)
                     if count == 0:
                         log.warning(
-                            "Anchor table (%s) returned 0 rows after all probes. "
-                            "Child tables will be skipped (no company code keys to filter on).",
-                            tbl_name,
+                            "Anchor table (%s) returned no rows — master tables skipped "
+                            "(no keys to filter on).", tbl_name,
                         )
-                        break   # Nothing to drive T001 with; abort remaining tables.
+                        break
                 else:
                     ok, count = extract_table(tbl_def, sap, loader, cfg, log)
                     results[tbl_name] = (ok, count)
@@ -1261,6 +1277,11 @@ def main() -> None:
             except Exception:
                 log.exception("Table %s FAILED.", tbl_name)
                 results[tbl_name] = (False, 0)
+                try:
+                    if loader.conn is not None and not loader.conn.closed:
+                        loader.conn.rollback()
+                except Exception:
+                    pass
 
     finally:
         sap.close()
@@ -1275,7 +1296,9 @@ def main() -> None:
     log.info("Active RFC function : %s", RFC_FUNCTION_PRIORITY[sap._fn_index])
     log.info("Active WHERE syntax : %s", "IN (...)" if _USE_IN_OPERATOR else "OR-chained =")
     log.info("Key sets collected:")
-    log.info("    BUKRS : %d company codes", len(_BUKRS_SET))
+    log.info("    RBUKRS : %d company codes", len(_BUKRS_SET))
+    log.info("    LIFNR  : %d vendors", len(_LIFNR_SET))
+    log.info("    KUNNR  : %d customers", len(_KUNNR_SET))
     log.info("Succeeded (%d):", len(succeeded))
     for tbl, count in succeeded:
         log.info("    %-20s  %d rows", tbl, count)
@@ -1284,14 +1307,13 @@ def main() -> None:
     else:
         log.info("All tables extracted successfully.")
     log.info("=" * 60)
+    p = STAGING_PREFIX.lower()
     log.info(
-        "Downstream hint: UNION stg_sap_fbl3n_bsis (open) + stg_sap_fbl3n_bsas (cleared) "
-        "and JOIN stg_sap_fbl3n_t001 ON BUKRS to replicate FBL3N output."
+        "Downstream: stg_sap_%s_acdoca split by KOART — K → FBL1N (join stg_sap_%s_lfa1), "
+        "D → FBL5N (join stg_sap_%s_kna1), S/M → FBL3N; join stg_sap_%s_t001 ON rbukrs.",
+        p, p, p, p,
     )
-    log.info(
-        "Purchase Document (Purch.Doc.) requires an additional BSEG read "
-        "keyed by BELNR+GJAHR+BUZEI. See design note in module docstring."
-    )
+    log.info("XBLNR (BKPF) and payment terms (BSEG) are not in ACDOCA — not extracted.")
     log.info("=" * 60)
 
     if failed:
@@ -1303,4 +1325,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nExtraction cancelled by user.")
-        sys.exit(1)

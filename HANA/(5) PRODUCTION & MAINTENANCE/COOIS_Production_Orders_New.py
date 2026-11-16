@@ -1,80 +1,84 @@
 """
 SAP COOIS — Production Order Information System Staging Extractor
 =================================================================
-Extracts columns matching the COOIS (Production Order Information System)
-transaction report from SAP ECC PP (Production Planning) tables and loads
-them into SQL Server staging tables.
+Version 1.1.0
 
-COOIS Report Column → SAP Field Mapping
-----------------------------------------
-Plant                → AUFK.WERKS  (order plant)
-Created on           → AUFK.ERDAT  (order creation date)
-Order                → AUFK.AUFNR  (production order number)
-Material             → AFPO.MATNR  (material number produced)
-Material description → MAKT.MAKTX  (material short text)
-Target qty           → AFPO.PSMNG  (planned order quantity)
-Del. qty             → AFPO.WEMNG  (quantity of goods received / delivered)
-Unit                 → AFPO.MEINS  (base unit of measure)
-Bsc start            → AFKO.GSTRP  (basic start date)
-Basic fin.           → AFKO.GLTRP  (basic finish date)
-System Status        → JEST.STAT + TJ02T.TXT04 (via AUFK.OBJNR)
+Extracts the SAP tables behind the COOIS (Production Order Information
+System) report from SAP S/4HANA (client 500) and loads them into PostgreSQL
+staging tables  sap_stg_hana.stg_sap_coois_<table>  (all columns TEXT,
+plus load_ts and extraction_id). Staging tables are truncated, never dropped.
 
-Source tables (extraction order):
-  Pass 1 — AUFK : Production order master (anchor). Collects AUFNR & OBJNR.
-  Pass 2 — AFKO : Order header scheduling data. Collects dates.
-  Pass 3 — AFPO : Order item (material, quantities, UoM).
-  Pass 4 — MAKT : Material descriptions (short texts).
-  Pass 5 — JEST : Individual object statuses (active only).
-  Pass 6 — TJ02T: System status texts (short + long).
+Change log
+----------
+1.0.0  Original (connections.py integrated). Old commented-out copy of the
+       script removed in 1.1.0.
+1.1.0  >>> CHANGED (v1.1-1) _build_in_options / _build_or_options wrap all
+           IN / OR groups in parentheses before "AND <extra>".
+           Before: F IN (..) OR F IN (..) AND extra -> extra only applied to
+           the last group (pitfall P1: other languages in MAKT/TJ02T/CEPCT,
+           inactive JEST rows).
+       >>> CHANGED (v1.1-2) BATCH_SIZE default and cap raised to 100,000 so
+           each table is read in one RFC call; WARNING logged if a table
+           needs more than one batch (pitfall P2: ROWSKIPS paging is not
+           order-stable -> duplicates AND missing rows).
+       >>> CHANGED (v1.1-3) AUFK: new field AUTYP (order category) and new
+           filter ORDER_CATEGORIES = ['10']. Before, AUFK had no category
+           filter, so PM orders (cat. 30) were staged. Confirmed in SE16N:
+           plant 1102, Oct 2026 has categories 10 and 30 only.
+       >>> CHANGED (v1.1-4) New pass 8: T003P order type texts (replaces the
+           hardcoded CASE in the query, pitfall P7). AUART key set added.
+       >>> CHANGED (v1.1-5) Loader runs ALTER TABLE .. ADD COLUMN IF NOT
+           EXISTS for every column, so new fields (AUTYP) reach existing
+           staging tables (pitfall P21).
+       >>> CHANGED (v1.1-6) Default window set to the validation month
+           (01.10.2026-31.10.2026). The orchestrator / .env still override it;
+           always check the "Date from / Date to" lines in the log (P3).
 
-Fallback behaviour (mirrors IH08 extractor pattern)
-----------------------------------------------------
-  WHERE syntax  : First attempts IN (...) operator. On zero rows from the
-                  anchor table (AUFK), retries with OR-chained = clauses.
-  RFC function  : Tries BBP_RFC_READ_TABLE first, then RFC_READ_TABLE.
-  Probe order   : Four combinations are tried in sequence:
-                    1. BBP_RFC_READ_TABLE  + IN  syntax
-                    2. BBP_RFC_READ_TABLE  + OR  syntax
-                    3. RFC_READ_TABLE      + IN  syntax
-                    4. RFC_READ_TABLE      + OR  syntax
-                  The winning combination is used for all subsequent tables.
+Source tables (extraction order)
+--------------------------------
+  Pass 1  AUFK  : Order master (anchor). WERKS + ERDAT + AUTYP + LOEKZ = ''.
+                  Collects AUFNR, OBJNR, PRCTR, AUART.
+  Pass 2  AFKO  : Order header scheduling data (dates, GAMNG, GMEIN).
+  Pass 3  AFPO  : Order item (material, PSMNG, WEMNG, MEINS). Collects MATNR.
+  Pass 4  MAKT  : Material short texts (SPRAS = E).
+  Pass 5  JEST  : Object status, active only (INACT = ''). Collects STAT.
+  Pass 6  TJ02T : System status texts (SPRAS = E).
+  Pass 7  CEPCT : Profit centre texts (SPRAS = E).
+  Pass 8  T003P : Order type texts (SPRAS = E).
 
-Date filter
------------
-  AUFK.ERDAT is used to restrict extraction to the chosen period.
-  Set DATE_FROM / DATE_TO as YYYYMMDD strings (or env vars).
-  Leave DATE_FROM empty ("") to skip the lower date boundary.
-  Leave DATE_TO   empty ("") to skip the upper date boundary.
+Fallback behaviour
+------------------
+  The anchor table is probed with BBP_RFC_READ_TABLE / RFC_READ_TABLE and
+  IN / OR syntax; the first combination returning rows is used for all
+  following tables.
 """
 
 from __future__ import annotations
 
 import os
-import platform
-
-# -------------------------------------------------------------
-# PostgreSQL DLL handling (required for Python 3.8+ on Windows)
-# Replace the path below with your actual PostgreSQL bin path.
-# -------------------------------------------------------------
-pg_bin_path = r"C:\Program Files\PostgreSQL\18\bin"
-
-if platform.system() == "Windows":
-    if os.path.exists(pg_bin_path):
-        os.add_dll_directory(pg_bin_path)
-    # Also point to the current script directory where DLLs may be copied.
-    os.add_dll_directory(os.getcwd())
-
-import logging
 import sys
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
-import psycopg2
-from psycopg2 import extras
-from dotenv import load_dotenv
-from pyrfc import (
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+for _p in (_THIS_DIR, os.path.dirname(_THIS_DIR), os.path.dirname(os.path.dirname(_THIS_DIR))):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
+# connections.py must be imported BEFORE pyrfc / psycopg2 (.env + DLL paths)
+from connections import (  # noqa: E402
+    get_postgres_connection,
+    get_postgres_schema,
+    get_sap_connection,
+)
+
+import logging  # noqa: E402
+import time  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from datetime import datetime  # noqa: E402
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple  # noqa: E402
+
+import psycopg2  # noqa: E402
+from psycopg2 import extras  # noqa: E402
+from pyrfc import (  # noqa: E402
     ABAPApplicationError,
     ABAPRuntimeError,
     CommunicationError,
@@ -82,45 +86,35 @@ from pyrfc import (
     LogonError,
 )
 
-# ---------------------------------------------------------------------------
-# RFC SDK registration
-# ---------------------------------------------------------------------------
-load_dotenv()
-
-RFC_SDK_PATH = os.getenv("RFC_SDK_PATH", r"C:\nwrfcsdk\lib")
-if os.path.isdir(RFC_SDK_PATH):
-    if sys.platform == "win32":
-        try:
-            os.add_dll_directory(RFC_SDK_PATH)
-        except AttributeError:
-            os.environ["PATH"] = RFC_SDK_PATH + ";" + os.environ.get("PATH", "")
-    else:
-        os.environ["PATH"] = RFC_SDK_PATH + ":" + os.environ.get("PATH", "")
+SAP_SYSTEM: str = "HANA"
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-# Plant filter — AUFK.WERKS. Use [""] to match blank plant or all plants
-# if your RFC variant ignores empty strings.  Set e.g. ["D001"] to restrict.
-PLANTS: List[str] = ["1202"]
+# Plant filter — AUFK.WERKS
+PLANTS: List[str] = ["1102"]
 
-# Order type filter — AUFK.AUART.  Leave [] for all types.
-# Common PP types: PP01 = standard production, PP02 = repetitive, etc.
+# Order type filter — AUFK.AUART. Leave [] for all types of the categories below.
 ORDER_TYPES: List[str] = []
 
-# Date range on AUFK.ERDAT (order creation date) — format YYYYMMDD
-# Set both to "" to disable the date filter entirely.
-DATE_FROM: str = os.getenv("DATE_FROM", "20251001")   # e.g. "20260101"
-DATE_TO:   str = os.getenv("DATE_TO",   "20251231")   # e.g. "20260228"
+# >>> CHANGED (v1.1-3): order category filter — AUFK.AUTYP.
+#   10 = production order (COOIS), 40 = process order (COOISPI),
+#   20 = network/PS, 30 = maintenance order (IW39).
+# Confirmed (A): SE16N AUFK, WERKS 1102, ERDAT 01.10-31.10.2026 shows only
+# categories 10 and 30. 30 = PM orders (IW39), so COOIS = category 10.
+ORDER_CATEGORIES: List[str] = ["10"]
 
-# Language key for MAKT and TJ02T text lookups
+# >>> CHANGED (v1.1-6): defaults = validation window. Env vars override.
+DATE_FROM: str = os.getenv("DATE_FROM", "20261001")
+DATE_TO:   str = os.getenv("DATE_TO",   "20261031")
+
+# Language key for MAKT, TJ02T, CEPCT and T003P
 LANGUAGE: str = "E"
 
-# Prefix used when naming staging tables: STG_SAP_COOIS_<TABLE>
+# Staging tables: stg_sap_coois_<table>
 STAGING_PREFIX: str = os.getenv("STAGING_PREFIX", "COOIS")
 
-# RFC functions tried in order during the anchor-table probe.
 RFC_FUNCTION_PRIORITY: List[str] = [
     "BBP_RFC_READ_TABLE",
     "RFC_READ_TABLE",
@@ -129,14 +123,13 @@ RFC_FUNCTION_PRIORITY: List[str] = [
 # ---------------------------------------------------------------------------
 # Runtime state (populated during extraction; used as WHERE filters)
 # ---------------------------------------------------------------------------
-_AUFNR_SET: Set[str] = set()   # production order numbers  (AUFK → child tables)
-_OBJNR_SET: Set[str] = set()   # object numbers            (AUFK → JEST)
-_MATNR_SET: Set[str] = set()   # material numbers          (AFPO → MAKT)
-_STAT_SET:  Set[str] = set()   # active status codes       (JEST → TJ02T)
+_AUFNR_SET: Set[str] = set()   # order numbers        (AUFK -> AFKO, AFPO)
+_OBJNR_SET: Set[str] = set()   # object numbers       (AUFK -> JEST)
+_MATNR_SET: Set[str] = set()   # material numbers     (AFPO -> MAKT)
+_STAT_SET:  Set[str] = set()   # active status codes  (JEST -> TJ02T)
+_PRCTR_SET: Set[str] = set()   # profit centres       (AUFK -> CEPCT)
+_AUART_SET: Set[str] = set()   # order types          (AUFK -> T003P)  >>> CHANGED (v1.1-4)
 
-# Active WHERE-syntax mode.
-# True  → use IN ('a','b','c')
-# False → use field='a' OR field='b' OR ...
 _USE_IN_OPERATOR: bool = True
 
 # ---------------------------------------------------------------------------
@@ -168,8 +161,11 @@ def _build_or_options(
     """
     Build RFC OPTIONS rows using OR-chained = clauses, chunked to 72 chars.
 
-    Example:
-        ( AUFNR = '000001' OR AUFNR = '000002' )
+    >>> CHANGED (v1.1-1): all groups are wrapped in one outer pair of
+    parentheses so that "AND <extra>" applies to every group:
+        ( ( AUFNR = '1' OR AUFNR = '2' )
+        OR ( AUFNR = '3' )
+        )
         AND LOEKZ = ''
     """
     if not values:
@@ -184,7 +180,7 @@ def _build_or_options(
     first_group = True
 
     while i < len(sorted_vals):
-        prefix = "( " if first_group else "OR ( "
+        prefix = "( ( " if first_group else "OR ( "
         row_parts: List[str] = []
         row_len = len(prefix)
 
@@ -200,6 +196,7 @@ def _build_or_options(
         options.append({"TEXT": prefix + " OR ".join(row_parts) + " )"})
         first_group = False
 
+    options.append({"TEXT": ")"})
     if extra:
         options.append({"TEXT": f"AND {extra}"})
 
@@ -214,7 +211,12 @@ def _build_in_options(
     """
     Build RFC OPTIONS rows using IN (...) clauses, chunked to 72 chars.
 
-    Automatically falls back to OR-syntax when _USE_IN_OPERATOR is False.
+    >>> CHANGED (v1.1-1): groups wrapped in parentheses:
+        ( AUFNR IN ('1','2')
+        OR AUFNR IN ('3')
+        )
+        AND INACT = ''
+    Falls back to OR syntax when _USE_IN_OPERATOR is False.
     """
     if not _USE_IN_OPERATOR:
         return _build_or_options(field_name, values, extra)
@@ -231,7 +233,7 @@ def _build_in_options(
     i = 0
 
     while i < len(sorted_vals):
-        prefix   = f"{field_name} IN (" if first_clause else f"OR {field_name} IN ("
+        prefix   = f"( {field_name} IN (" if first_clause else f"OR {field_name} IN ("
         max_fill = 72 - len(prefix) - 1
         row_vals: List[str] = []
         row_len = 0
@@ -248,6 +250,7 @@ def _build_in_options(
         options.append({"TEXT": prefix + ",".join(row_vals) + ")"})
         first_clause = False
 
+    options.append({"TEXT": ")"})
     if extra:
         options.append({"TEXT": f"AND {extra}"})
 
@@ -256,17 +259,11 @@ def _build_in_options(
 
 def _build_aufk_options() -> List[Dict[str, str]]:
     """
-    Build WHERE options for the anchor table AUFK.
-
-    Filters applied (all combined with AND):
-      - WERKS IN / = (plant list)
-      - AUART IN / = (order type list, if specified)
-      - ERDAT >= DATE_FROM (if specified)
-      - ERDAT <= DATE_TO   (if specified)
-      - LOEKZ = ''         (exclude deletion-flagged orders)
+    WHERE options for the anchor table AUFK (all combined with AND):
+      WERKS (plants), AUART (types, optional), AUTYP (categories, optional),
+      ERDAT window, LOEKZ = ''.
     """
     if _USE_IN_OPERATOR:
-        # --- IN syntax ---
         plants_str = ",".join(f"'{p}'" for p in PLANTS)
         where = f"WERKS IN ({plants_str})"
 
@@ -274,15 +271,22 @@ def _build_aufk_options() -> List[Dict[str, str]]:
             types_str = ",".join(f"'{t}'" for t in ORDER_TYPES)
             where += f" AND AUART IN ({types_str})"
 
+        # >>> CHANGED (v1.1-3): order category filter
+        if ORDER_CATEGORIES:
+            cats_str = ",".join(f"'{c}'" for c in ORDER_CATEGORIES)
+            where += f" AND AUTYP IN ({cats_str})"
+
         if DATE_FROM:
             where += f" AND ERDAT GE '{DATE_FROM}'"
         if DATE_TO:
             where += f" AND ERDAT LE '{DATE_TO}'"
 
+        # PENDING (B): deletion-flagged orders are excluded at source, so the
+        # final columns "Del. Flag" / "Deletion Flagged" are always blank / N.
+        # Keep in line with the COOIS selection used on the SAP side.
         where += " AND LOEKZ = ''"
         return _format_options(where)
 
-    # --- OR-chained syntax ---
     options: List[Dict[str, str]] = []
 
     plant_clauses = " OR ".join(f"WERKS = '{p}'" for p in PLANTS)
@@ -291,6 +295,11 @@ def _build_aufk_options() -> List[Dict[str, str]]:
     if ORDER_TYPES:
         type_clauses = " OR ".join(f"AUART = '{t}'" for t in ORDER_TYPES)
         options.append({"TEXT": f"AND ( {type_clauses} )"})
+
+    # >>> CHANGED (v1.1-3)
+    if ORDER_CATEGORIES:
+        cat_clauses = " OR ".join(f"AUTYP = '{c}'" for c in ORDER_CATEGORIES)
+        options.append({"TEXT": f"AND ( {cat_clauses} )"})
 
     if DATE_FROM:
         options.append({"TEXT": f"AND ERDAT GE '{DATE_FROM}'"})
@@ -304,31 +313,28 @@ def _build_aufk_options() -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 # TABLE DEFINITIONS
 # ---------------------------------------------------------------------------
-#
-# Each entry drives one complete extract-and-load pipeline pass.
-# Keys:
-#   table        → SAP transparent table name
-#   description  → human-readable label (for logs)
-#   columns      → fields to read (must be a subset of the table's columns)
-#   options_fn   → callable returning RFC OPTIONS rows (WHERE clause)
-#   primary_keys → used only for documentation / future dedup logic
-#   key_out      → {SAP_COLUMN: "_GLOBAL_SET_NAME"} — populates runtime key sets
-#   is_anchor    → True on the first table; triggers the RFC/syntax probe
+#   table        -> SAP transparent table name
+#   description  -> label for logs
+#   columns      -> fields to read
+#   options_fn   -> callable returning RFC OPTIONS rows (WHERE clause)
+#   primary_keys -> documentation
+#   key_out      -> {SAP_COLUMN: "_GLOBAL_SET_NAME"} fills runtime key sets
+#   is_anchor    -> True on the first table; triggers the RFC/syntax probe
 #
 STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
 
-    # ── PASS 1 ─ AUFK : Production Order Master (anchor) ──────────────────
-    # Provides order-level attributes: plant, dates, order type, status link.
+    # PASS 1 - AUFK : Order master (anchor)
     {
         "table": "AUFK",
-        "description": "Production Order Master",
+        "description": "Order Master",
         "columns": [
-            "AUFNR",   # Production order number
+            "AUFNR",   # Order number
             "AUART",   # Order type
+            "AUTYP",   # Order category  >>> CHANGED (v1.1-3)
             "WERKS",   # Plant
             "ERDAT",   # Created on
-            "KTEXT",   # Order description / short text
-            "OBJNR",   # Object number  → JEST status lookup
+            "KTEXT",   # Order description
+            "OBJNR",   # Object number -> JEST
             "LOEKZ",   # Deletion flag
             "PRCTR",   # Profit center
             "KOSTL",   # Cost center
@@ -338,27 +344,26 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         "key_out": {
             "AUFNR": "_AUFNR_SET",
             "OBJNR": "_OBJNR_SET",
+            "PRCTR": "_PRCTR_SET",
+            "AUART": "_AUART_SET",   # >>> CHANGED (v1.1-4)
         },
         "is_anchor": True,
     },
 
-    # ── PASS 2 ─ AFKO : Order Header Scheduling Data ───────────────────────
-    # One row per production order; provides basic start/finish dates and
-    # the total order quantity (which is the same as AFPO.PSMNG for simple
-    # single-item orders but stored at header level here).
+    # PASS 2 - AFKO : Order header scheduling data
     {
         "table": "AFKO",
         "description": "Order Header Scheduling Data",
         "columns": [
-            "AUFNR",   # Order number (FK to AUFK)
-            "GSTRP",   # Basic start date         → "Bsc start" in COOIS
-            "GLTRP",   # Basic finish date         → "Basic fin." in COOIS
+            "AUFNR",   # Order number
+            "GSTRP",   # Basic start date
+            "GLTRP",   # Basic finish date
             "GSTRS",   # Scheduled start
             "GLTRS",   # Scheduled finish
             "GSTRI",   # Actual start date
             "GLTRI",   # Actual finish date
             "GAMNG",   # Total order quantity
-            "GMEIN",   # Base unit of measure (header level)
+            "GMEIN",   # Unit of measure (header)
             "FEVOR",   # Production supervisor
             "PLGRP",   # Planner group
         ],
@@ -366,26 +371,23 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         "primary_keys": ["AUFNR"],
     },
 
-    # ── PASS 3 ─ AFPO : Order Item (Material + Quantities) ─────────────────
-    # Production orders may theoretically have multiple items (POSNR), but
-    # in standard PP there is always item 0001.  We read all items and let
-    # the consumer decide how to handle multi-item orders.
+    # PASS 3 - AFPO : Order item (material + quantities)
     {
         "table": "AFPO",
-        "description": "Production Order Item (Material & Quantities)",
+        "description": "Order Item (Material & Quantities)",
         "columns": [
-            "AUFNR",   # Order number (FK)
+            "AUFNR",   # Order number
             "POSNR",   # Item number
-            "MATNR",   # Material number           → MAKT description lookup
-            "PSMNG",   # Planned (target) quantity → "Target qty" in COOIS
-            "WEMNG",   # GR quantity (delivered)   → "Del. qty"   in COOIS
-            "MEINS",   # Base unit of measure       → "Unit"       in COOIS
-            "DWERK",   # Receiving / production plant
+            "MATNR",   # Material
+            "PSMNG",   # Order item quantity  -> "Target qty"
+            "WEMNG",   # Goods received qty   -> "Del. qty"
+            "MEINS",   # Unit of measure      -> "Unit"
+            "DWERK",   # Production plant
             "LGORT",   # Storage location
             "VERID",   # Production version
-            "LTRMP",   # Delivery date from planned order
+            "LTRMP",   # Planned delivery date
             "LTRMI",   # Actual delivery / finish date
-            "ELIKZ",   # Delivery-completed indicator
+            "ELIKZ",   # Delivery completed indicator
         ],
         "options_fn": lambda: _build_in_options("AUFNR", _AUFNR_SET),
         "primary_keys": ["AUFNR", "POSNR"],
@@ -394,33 +396,22 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         },
     },
 
-    # ── PASS 4 ─ MAKT : Material Short Texts ───────────────────────────────
-    # Driven by _MATNR_SET populated from AFPO.
+    # PASS 4 - MAKT : Material short texts
     {
         "table": "MAKT",
         "description": "Material Descriptions",
-        "columns": [
-            "MATNR",   # Material number (FK)
-            "SPRAS",   # Language key
-            "MAKTX",   # Material description (short text) → "Material description"
-        ],
+        "columns": ["MATNR", "SPRAS", "MAKTX"],
         "options_fn": lambda: _build_in_options(
             "MATNR", _MATNR_SET, extra=f"SPRAS = '{LANGUAGE}'"
         ),
         "primary_keys": ["MATNR", "SPRAS"],
     },
 
-    # ── PASS 5 ─ JEST : Individual Object Status (active only) ─────────────
-    # Driven by _OBJNR_SET from AUFK.OBJNR.
-    # INACT = '' means the status flag is currently active (not deactivated).
+    # PASS 5 - JEST : Object status (active only)
     {
         "table": "JEST",
         "description": "Order Status (Active)",
-        "columns": [
-            "OBJNR",   # Object number (FK to AUFK.OBJNR)
-            "STAT",    # Status code (e.g. I0002 = REL, I0009 = TECO)
-            "INACT",   # Inactive flag — we filter INACT = '' (active)
-        ],
+        "columns": ["OBJNR", "STAT", "INACT"],
         "options_fn": lambda: _build_in_options(
             "OBJNR", _OBJNR_SET, extra="INACT = ''"
         ),
@@ -430,41 +421,61 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         },
     },
 
-    # ── PASS 6 ─ TJ02T : System Status Texts ───────────────────────────────
-    # Translates numeric STAT codes (e.g. I0002) to readable text (REL, TECO …).
-    # TXT04 = 4-char short code shown in COOIS "System Status" column.
-    # TXT30 = 30-char long description.
+    # PASS 6 - TJ02T : System status texts
     {
         "table": "TJ02T",
         "description": "System Status Texts",
-        "columns": [
-            "ISTAT",   # System status code (= JEST.STAT)
-            "SPRAS",   # Language key
-            "TXT04",   # Short status text (e.g. REL, TECO, DLV)  → COOIS display
-            "TXT30",   # Long status text (e.g. Released, Technically completed)
-        ],
+        "columns": ["ISTAT", "SPRAS", "TXT04", "TXT30"],
         "options_fn": lambda: _build_in_options(
             "ISTAT", _STAT_SET, extra=f"SPRAS = '{LANGUAGE}'"
         ),
         "primary_keys": ["ISTAT", "SPRAS"],
+    },
+
+    # PASS 7 - CEPCT : Profit centre texts
+    {
+        "table": "CEPCT",
+        "description": "Profit Centre Text Table",
+        "columns": ["SPRAS", "PRCTR", "DATBI", "KOKRS", "KTEXT", "LTEXT", "MCTXT"],
+        "options_fn": lambda: _build_in_options(
+            "PRCTR",
+            {p for p in _PRCTR_SET if p},
+            extra=f"SPRAS = '{LANGUAGE}'",
+        ),
+        "primary_keys": ["SPRAS", "PRCTR", "DATBI", "KOKRS"],
+    },
+
+    # PASS 8 - T003P : Order type texts  >>> CHANGED (v1.1-4)
+    {
+        "table": "T003P",
+        "description": "Order Type Texts",
+        "columns": ["SPRAS", "AUART", "TXT"],
+        "options_fn": lambda: _build_in_options(
+            "AUART", _AUART_SET, extra=f"SPRAS = '{LANGUAGE}'"
+        ),
+        "primary_keys": ["SPRAS", "AUART"],
     },
 ]
 
 # ---------------------------------------------------------------------------
 # Extraction tuning
 # ---------------------------------------------------------------------------
+_MAX_BATCH_SIZE = 100_000   # >>> CHANGED (v1.1-2): was 10,000
+
+
 @dataclass
 class ExtractionConfig:
-    batch_size:       int   = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "10000")))
+    # >>> CHANGED (v1.1-2): default 100,000 -> one RFC call per table
+    batch_size:       int   = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "100000")))
     max_buffer_width: int   = field(default_factory=lambda: int(os.getenv("MAX_BUFFER_WIDTH", "480")))
     max_retries:      int   = field(default_factory=lambda: int(os.getenv("MAX_RETRIES",      "3")))
     retry_delay_s:    float = field(default_factory=lambda: float(os.getenv("RETRY_DELAY_S",  "5")))
     commit_every:     int   = field(default_factory=lambda: int(os.getenv("COMMIT_EVERY",     "100000")))
-    staging_schema:   str   = field(default_factory=lambda: os.getenv("STAGING_SCHEMA_ECC",   "sap_stg_ecc"))
+    staging_schema:   str   = field(default_factory=lambda: get_postgres_schema(SAP_SYSTEM))
 
     def __post_init__(self) -> None:
-        if self.batch_size > 10_000:
-            raise ValueError("batch_size should not exceed 10 000 for RFC stability.")
+        if self.batch_size > _MAX_BATCH_SIZE:
+            raise ValueError(f"batch_size should not exceed {_MAX_BATCH_SIZE:,} for RFC stability.")
         if self.max_buffer_width > 512:
             raise ValueError("max_buffer_width cannot exceed SAP RFC limit of 512.")
 
@@ -500,39 +511,11 @@ def _build_logger(run_id: str) -> logging.Logger:
     return log
 
 # ---------------------------------------------------------------------------
-# Environment / connection helpers
-# ---------------------------------------------------------------------------
-def _require_env(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
-        raise EnvironmentError(f"Required env var '{key}' is missing or empty.")
-    return val
-
-
-def build_sap_config() -> Dict[str, str]:
-    return {
-        "user":   _require_env("SAP_USER"),
-        "passwd": _require_env("SAP_PASSWORD"),
-        "ashost": _require_env("SAP_ASHOST"),
-        "sysnr":  _require_env("SAP_SYSNR"),
-        "client": _require_env("SAP_CLIENT"),
-        "lang":   os.getenv("SAP_LANG", "EN"),
-    }
-
-
-# ---------------------------------------------------------------------------
 # SAP connection wrapper — with RFC function fallback
 # ---------------------------------------------------------------------------
 class SAPConnection:
-    """
-    Wraps a pyrfc Connection and manages the active RFC read-table function.
-
-    Fallback order is defined by RFC_FUNCTION_PRIORITY.  Call
-    switch_rfc_function() to advance to the next candidate.
-    """
-
-    def __init__(self, config: Dict[str, str], log: logging.Logger) -> None:
-        self._cfg      = config
+    def __init__(self, system: str, log: logging.Logger) -> None:
+        self._system   = system
         self._log      = log
         self._fn_index = 0
         self.conn: Optional[Connection] = None
@@ -545,19 +528,16 @@ class SAPConnection:
     def switch_rfc_function(self) -> bool:
         if self._fn_index < len(RFC_FUNCTION_PRIORITY) - 1:
             self._fn_index += 1
-            self._log.warning("Switching RFC read function → %s", self.rfc_function)
+            self._log.warning("Switching RFC read function -> %s", self.rfc_function)
             return True
-        self._log.error(
-            "All RFC read functions exhausted (%s). No further fallback.",
-            RFC_FUNCTION_PRIORITY,
-        )
+        self._log.error("All RFC read functions exhausted (%s).", RFC_FUNCTION_PRIORITY)
         return False
 
     def _connect(self) -> None:
         for attempt in range(1, 4):
             try:
-                self._log.info("Connecting to SAP (attempt %d/3)...", attempt)
-                self.conn = Connection(**self._cfg)
+                self._log.info("Connecting to SAP %s (attempt %d/3)...", self._system, attempt)
+                self.conn = get_sap_connection(self._system)
                 self._log.info("SAP connection established.")
                 return
             except LogonError:
@@ -685,9 +665,13 @@ class ColumnChunker:
         if current:
             result.append(current)
 
-        self._log.info(
-            "Column chunking: %d columns → %d chunk(s) (buffer limit %d).",
+        level = logging.INFO if len(result) == 1 else logging.WARNING
+        self._log.log(
+            level,
+            "Column chunking: %d columns -> %d chunk(s) (buffer limit %d)%s",
             len(self._columns), len(result), self._max_buffer,
+            "" if len(result) == 1 else
+            " -- rows from separate calls are merged by position; verify no mixed rows.",
         )
         return result
 
@@ -725,7 +709,7 @@ def _collect_keys(
         added = len(target_set) - before
         if added:
             log.debug(
-                "Collected %d new '%s' keys (total %d) → %s",
+                "Collected %d new '%s' keys (total %d) -> %s",
                 added, col, len(target_set), set_name,
             )
 
@@ -752,24 +736,42 @@ class BatchExtractor:
         self._log     = log
 
     def batches(self) -> Generator[List[List[Any]], None, None]:
-        offset = 0
-        total  = 0
+        offset    = 0
+        total     = 0
+        batch_num = 0
 
         while True:
             batch = self._fetch_offset(offset)
             if not batch:
-                self._log.info(
-                    "[%s] No more rows. Total extracted: %d", self._table, total
-                )
+                self._log.info("[%s] No more rows. Total extracted: %d", self._table, total)
+                if batch_num > 1:
+                    # >>> CHANGED (v1.1-2): paging warning
+                    self._log.warning(
+                        "[%s] Read in %d batches -- paging may duplicate or drop rows "
+                        "(ROWSKIPS is not order-stable). Use a smaller date window.",
+                        self._table, batch_num,
+                    )
                 break
 
-            total  += len(batch)
-            offset += self._cfg.batch_size
+            batch_num += 1
+            total     += len(batch)
+            offset    += self._cfg.batch_size
             self._log.info(
                 "[%s] Fetched %d rows (running total: %d).",
                 self._table, len(batch), total,
             )
             yield batch
+
+            # A batch smaller than ROWCOUNT is the last one; skip the extra call.
+            if len(batch) < self._cfg.batch_size:
+                self._log.info("[%s] No more rows. Total extracted: %d", self._table, total)
+                if batch_num > 1:
+                    self._log.warning(
+                        "[%s] Read in %d batches -- paging may duplicate or drop rows "
+                        "(ROWSKIPS is not order-stable). Use a smaller date window.",
+                        self._table, batch_num,
+                    )
+                break
 
     def _fetch_offset(self, offset: int) -> List[List[Any]]:
         merged: Dict[int, Dict[str, str]] = {}
@@ -817,17 +819,10 @@ class BatchExtractor:
         ]
 
 # ---------------------------------------------------------------------------
-# SQL table manager
+# PostgreSQL staging loader
 # ---------------------------------------------------------------------------
 class PostgresLoader:
-    def __init__(
-        self,
-        cfg:      Dict[str, Any],
-        schema:   str,
-        prefix:   str,
-        log:      logging.Logger,
-    ) -> None:
-        self._cfg    = cfg
+    def __init__(self, schema: str, prefix: str, log: logging.Logger) -> None:
         self._schema = schema
         self._prefix = prefix
         self._log    = log
@@ -837,7 +832,7 @@ class PostgresLoader:
     def connect(self) -> None:
         self._log.info("Connecting to PostgreSQL...")
         try:
-            self.conn    = psycopg2.connect(**self._cfg)
+            self.conn    = get_postgres_connection()
             self._cursor = self.conn.cursor()
             self._log.info("PostgreSQL connection established.")
         except Exception:
@@ -845,15 +840,14 @@ class PostgresLoader:
             raise
 
     def create_staging_table(self, sap_table: str, columns: List[str]) -> str:
-        stg_name  = f"stg_sap_{self._prefix.lower()}_{sap_table.lower()}"
+        stg_name  = f"stg_sap_coois_{sap_table.lower()}"
         safe_cols = [c.replace("-", "_").replace("/", "_").lower() for c in columns]
 
         self._cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema};")
 
         col_defs = ",\n    ".join([f'"{c}" TEXT' for c in safe_cols])
         ddl = f"""
-        DROP TABLE IF EXISTS {self._schema}.{stg_name};
-        CREATE TABLE {self._schema}.{stg_name} (
+        CREATE TABLE IF NOT EXISTS {self._schema}.{stg_name} (
             {col_defs},
             load_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             extraction_id UUID DEFAULT gen_random_uuid()
@@ -861,16 +855,19 @@ class PostgresLoader:
         """
         self._log.info("Creating staging table %s.%s...", self._schema, stg_name)
         self._cursor.execute(ddl)
+
+        # >>> CHANGED (v1.1-5): add columns missing on an existing table (P21)
+        for c in safe_cols:
+            self._cursor.execute(
+                f'ALTER TABLE {self._schema}.{stg_name} ADD COLUMN IF NOT EXISTS "{c}" TEXT;'
+            )
+
+        self._cursor.execute(f"TRUNCATE TABLE {self._schema}.{stg_name};")
         self.conn.commit()
-        self._log.info("Staging table %s.%s created.", self._schema, stg_name)
+        self._log.info("Staging table %s.%s ready and truncated.", self._schema, stg_name)
         return f'"{self._schema}"."{stg_name}"'
 
-    def load_batch(
-        self,
-        stg_table: str,
-        columns:   List[str],
-        rows:      List[List[Any]],
-    ) -> None:
+    def load_batch(self, stg_table: str, columns: List[str], rows: List[List[Any]]) -> None:
         if not rows:
             return
         safe_cols = [f'"{c.replace("-", "_").replace("/", "_").lower()}"' for c in columns]
@@ -913,9 +910,9 @@ def extract_table(
     log.info("Syntax : %s", "IN (...)" if _USE_IN_OPERATOR else "OR-chained =")
     log.info("Fields : %s", columns)
     if options:
-        preview = " | ".join(r["TEXT"] for r in options[:4])
-        suffix  = " | ..." if len(options) > 4 else ""
-        log.info("OPTIONS (%d rows): %s%s", len(options), preview, suffix)
+        head   = " | ".join(r["TEXT"] for r in options[:3])
+        tail   = " | ".join(r["TEXT"] for r in options[-2:]) if len(options) > 3 else ""
+        log.info("OPTIONS (%d rows): %s%s", len(options), head, f" | ... | {tail}" if tail else "")
 
     t0 = time.time()
 
@@ -947,14 +944,11 @@ def extract_table(
 
     elapsed = time.time() - t0
     rate    = rows_loaded / elapsed if elapsed > 0 else 0
-    log.info(
-        "[%s] Done — %d rows in %.1fs (%.0f rows/s).",
-        table, rows_loaded, elapsed, rate,
-    )
+    log.info("[%s] Done — %d rows in %.1fs (%.0f rows/s).", table, rows_loaded, elapsed, rate)
     return True, rows_loaded
 
 # ---------------------------------------------------------------------------
-# Anchor-table probe: try all RFC fn × WHERE syntax combinations
+# Anchor-table probe
 # ---------------------------------------------------------------------------
 def _probe_anchor_table(
     anchor_def: Dict[str, Any],
@@ -963,25 +957,15 @@ def _probe_anchor_table(
     cfg:        ExtractionConfig,
     log:        logging.Logger,
 ) -> Tuple[bool, int]:
-    """
-    Try to extract the anchor table (AUFK) using up to four combinations:
-
-        Probe 1  BBP_RFC_READ_TABLE + IN  syntax
-        Probe 2  BBP_RFC_READ_TABLE + OR  syntax
-        Probe 3  RFC_READ_TABLE     + IN  syntax
-        Probe 4  RFC_READ_TABLE     + OR  syntax
-
-    Stops as soon as a non-zero row count is achieved.
-    If all probes return 0 rows the filter criteria returned no data.
-    """
+    """Try RFC function x WHERE syntax combinations until AUFK returns rows."""
     global _USE_IN_OPERATOR
 
     table = anchor_def["table"].upper()
 
     attempts: List[Tuple[bool, int]] = []
     for fn_idx in range(len(RFC_FUNCTION_PRIORITY)):
-        attempts.append((True,  fn_idx))   # IN  syntax
-        attempts.append((False, fn_idx))   # OR  syntax
+        attempts.append((True,  fn_idx))
+        attempts.append((False, fn_idx))
 
     for probe_num, (use_in, fn_idx) in enumerate(attempts, start=1):
         _USE_IN_OPERATOR = use_in
@@ -989,13 +973,14 @@ def _probe_anchor_table(
 
         syntax_label = "IN (...)" if use_in else "OR-chained ="
         log.info(
-            "─── Anchor probe %d/%d: RFC=%s | syntax=%s ───",
+            "--- Anchor probe %d/%d: RFC=%s | syntax=%s ---",
             probe_num, len(attempts), sap.rfc_function, syntax_label,
         )
 
-        # Clear anchor key sets so a retry starts fresh
         _AUFNR_SET.clear()
         _OBJNR_SET.clear()
+        _PRCTR_SET.clear()
+        _AUART_SET.clear()
 
         try:
             ok, count = extract_table(anchor_def, sap, loader, cfg, log)
@@ -1005,8 +990,7 @@ def _probe_anchor_table(
 
         if count > 0:
             log.info(
-                "✓ Anchor probe succeeded on attempt %d — "
-                "RFC=%s | syntax=%s | rows=%d",
+                "Anchor probe succeeded on attempt %d — RFC=%s | syntax=%s | rows=%d",
                 probe_num, sap.rfc_function, syntax_label, count,
             )
             return ok, count
@@ -1017,9 +1001,9 @@ def _probe_anchor_table(
         )
 
     log.error(
-        "All %d anchor probes returned 0 rows for %s. "
-        "Verify plant(s) %s, order types %s, and date range %s–%s in SAP.",
-        len(attempts), table, PLANTS, ORDER_TYPES or "ALL",
+        "All %d anchor probes returned 0 rows for %s. Verify plant(s) %s, "
+        "order types %s, categories %s and date range %s–%s in SAP.",
+        len(attempts), table, PLANTS, ORDER_TYPES or "ALL", ORDER_CATEGORIES or "ALL",
         DATE_FROM or "unbounded", DATE_TO or "unbounded",
     )
     return True, 0
@@ -1035,31 +1019,24 @@ def main() -> None:
     log.info("SAP COOIS Production Order Staging Pipeline  [run: %s]", run_id)
     log.info("Plants         : %s", PLANTS)
     log.info("Order types    : %s", ORDER_TYPES if ORDER_TYPES else "ALL")
-    log.info("Date from      : %s", DATE_FROM   if DATE_FROM   else "unbounded")
-    log.info("Date to        : %s", DATE_TO     if DATE_TO     else "unbounded")
+    log.info("Categories     : %s", ORDER_CATEGORIES if ORDER_CATEGORIES else "ALL")
+    log.info("Date range     : %s -> %s", DATE_FROM or "unbounded", DATE_TO or "unbounded")
     log.info("Language       : %s", LANGUAGE)
-    log.info("Staging prefix : STG_SAP_%s_<TABLE>", STAGING_PREFIX)
+    log.info("Staging prefix : stg_sap_%s_<table>", STAGING_PREFIX.lower())
     log.info("Tables         : %d", len(STAGING_TABLE_DEFS))
     log.info("RFC priority   : %s", RFC_FUNCTION_PRIORITY)
     log.info("=" * 60)
 
     try:
-        cfg        = ExtractionConfig()
-        sap_config = build_sap_config()
-        pg_config  = {
-            "host":     _require_env("PG_HOST"),
-            "port":     os.getenv("PG_PORT", "5432"),
-            "database": _require_env("PG_DATABASE"),
-            "user":     _require_env("PG_USER"),
-            "password": _require_env("PG_PASSWORD"),
-        }
+        cfg = ExtractionConfig()
+        log.info("Batch size     : %d", cfg.batch_size)
     except (EnvironmentError, ValueError) as exc:
         log.critical("Configuration error: %s", exc)
         sys.exit(1)
 
     try:
-        sap    = SAPConnection(sap_config, log)
-        loader = PostgresLoader(pg_config, cfg.staging_schema, STAGING_PREFIX, log)
+        sap    = SAPConnection(SAP_SYSTEM, log)
+        loader = PostgresLoader(cfg.staging_schema, STAGING_PREFIX, log)
         loader.connect()
     except Exception:
         log.critical("Failed to establish connections — aborting.")
@@ -1077,7 +1054,7 @@ def main() -> None:
                     if count == 0:
                         log.warning(
                             "Anchor table (AUFK) returned 0 rows after all probes. "
-                            "Child tables will be skipped (no order keys to filter on)."
+                            "Child tables will be empty (no order keys to filter on)."
                         )
                 else:
                     ok, count = extract_table(tbl_def, sap, loader, cfg, log)
@@ -1101,10 +1078,12 @@ def main() -> None:
     log.info("Active RFC function : %s", RFC_FUNCTION_PRIORITY[sap._fn_index] if sap else "N/A")
     log.info("Active WHERE syntax : %s", "IN (...)" if _USE_IN_OPERATOR else "OR-chained =")
     log.info("Key sets collected:")
-    log.info("    AUFNR : %d production order numbers", len(_AUFNR_SET))
-    log.info("    OBJNR : %d object numbers",           len(_OBJNR_SET))
-    log.info("    MATNR : %d material numbers",         len(_MATNR_SET))
-    log.info("    STAT  : %d active status codes",      len(_STAT_SET))
+    log.info("    AUFNR : %d order numbers",      len(_AUFNR_SET))
+    log.info("    OBJNR : %d object numbers",     len(_OBJNR_SET))
+    log.info("    MATNR : %d material numbers",   len(_MATNR_SET))
+    log.info("    STAT  : %d active status codes", len(_STAT_SET))
+    log.info("    PRCTR : %d profit centres",     len(_PRCTR_SET))
+    log.info("    AUART : %d order types",        len(_AUART_SET))
     log.info("Succeeded (%d):", len(succeeded))
     for tbl, count in succeeded:
         log.info("    %-20s  %d rows", tbl, count)

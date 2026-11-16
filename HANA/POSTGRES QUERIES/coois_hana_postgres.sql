@@ -68,6 +68,32 @@ CTE_ORDER_PROGRESS AS (
             )
         END                                         AS pct_delivered
     FROM "sap_stg_hana"."stg_sap_coois_afpo"
+),
+
+CTE_PROFIT_CENTER AS (
+    SELECT
+        prctr,
+        kokrs,
+        ktext   AS profit_center_name,
+        ltext   AS profit_center_long_text
+    FROM (
+        SELECT
+            prctr,
+            kokrs,
+            ktext,
+            ltext,
+            ROW_NUMBER() OVER (
+                PARTITION BY prctr, kokrs
+                ORDER BY
+                    CASE WHEN NULLIF(datbi, '') IS NULL
+                              OR datbi >= TO_CHAR(CURRENT_DATE, 'YYYYMMDD')
+                         THEN 0 ELSE 1 END,
+                    COALESCE(NULLIF(datbi, ''), '00000000') DESC
+            ) AS rn
+        FROM "sap_stg_hana"."stg_sap_coois_cepct"
+        WHERE spras = 'E'
+    ) sub
+    WHERE rn = 1
 )
 
 /* ──────────────────────────────────────────────────────────────
@@ -91,6 +117,8 @@ SELECT
 
     ak.werks                                        AS "Plant",
     ak.prctr                                        AS "Profit Center",
+    pc.profit_center_name                           AS "Profit Center Name",
+    pc.profit_center_long_text                      AS "Profit Center Long Text",
     ak.kostl                                        AS "Cost Center",
 
     ak.erdat                                        AS "Created on",
@@ -160,6 +188,9 @@ LEFT JOIN CTE_ORDER_PROGRESS pr
 
 LEFT JOIN CTE_ORDER_STATUS os
     ON os.objnr = ak.objnr
+
+LEFT JOIN CTE_PROFIT_CENTER pc
+    ON pc.prctr = ak.prctr
 
 ORDER BY
     ak.erdat DESC,

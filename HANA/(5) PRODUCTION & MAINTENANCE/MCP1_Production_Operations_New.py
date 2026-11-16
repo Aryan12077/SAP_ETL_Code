@@ -29,6 +29,8 @@ Source tables (extraction order):
   Pass 4 — AFVV : Standard values / planned lead times per operation.
   Pass 5 — AFRU : Actual confirmations (actual lead times) per operation.
   Pass 6 — CRHD : Work centre master (name, plant). Driven by ARBID set.
+  Pass 7 — CEPCT: Profit centre text table. Driven by PRCTR set.
+  Pass 8 — T003P: Order types (texts). Driven by AUART set.
 
 Relationship chain:
   AUFK.AUFNR ──► AFKO.AUFNR  (1:1 – order header)
@@ -64,36 +66,44 @@ Time normalisation
   Actual confirmed work (AFRU.ISMNW) follows the same approach.
   Both normalised columns and the raw originals are written to staging so the
   consumer can verify the conversion.
+
+Change history:
+  1.1.0 — S022 (SFIS order operation data, the source of MCP1) added as the last
+          pass: SAP target / actual execution times and scrap per operation.
+          AUFK restricted to ORDER_CATEGORIES (10, 40): PM orders were included.
+          AFRU: STZHL extracted to exclude reversal documents.
+          _build_in_options / _build_or_options wrap the OR-ed groups in
+          parentheses so the extra filter applies to every group.
+          BATCH_SIZE 100 000 + WARNING when a table needs more than one batch.
+          Loader adds new columns to existing staging tables (ALTER ... IF NOT EXISTS).
 """
 
 from __future__ import annotations
 
 import os
-import platform
-
-# -------------------------------------------------------------
-# PostgreSQL DLL handling (required for Python 3.8+ on Windows)
-# Replace the path below with your actual PostgreSQL bin path.
-# -------------------------------------------------------------
-pg_bin_path = r"C:\Program Files\PostgreSQL\18\bin"
-
-if platform.system() == "Windows":
-    if os.path.exists(pg_bin_path):
-        os.add_dll_directory(pg_bin_path)
-    # Also point to the current script directory where DLLs may be copied.
-    os.add_dll_directory(os.getcwd())
-
-import logging
 import sys
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
-import psycopg2
-from psycopg2 import extras
-from dotenv import load_dotenv
-from pyrfc import (
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+for _p in (_THIS_DIR, os.path.dirname(_THIS_DIR), os.path.dirname(os.path.dirname(_THIS_DIR))):
+    if _p not in sys.path:
+        sys.path.append(_p)
+
+# connections.py must be imported BEFORE pyrfc / psycopg2 (.env + DLL paths)
+from connections import (  # noqa: E402
+    get_postgres_connection,
+    get_postgres_schema,
+    get_sap_connection,
+)
+
+import logging  # noqa: E402
+import time  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from datetime import datetime  # noqa: E402
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple  # noqa: E402
+
+import psycopg2  # noqa: E402
+from psycopg2 import extras  # noqa: E402
+from pyrfc import (  # noqa: E402
     ABAPApplicationError,
     ABAPRuntimeError,
     CommunicationError,
@@ -101,35 +111,26 @@ from pyrfc import (
     LogonError,
 )
 
-# ---------------------------------------------------------------------------
-# RFC SDK registration
-# ---------------------------------------------------------------------------
-load_dotenv()
+SAP_SYSTEM: str = "HANA"
 
-RFC_SDK_PATH = os.getenv("RFC_SDK_PATH", r"C:\nwrfcsdk\lib")
-if os.path.isdir(RFC_SDK_PATH):
-    if sys.platform == "win32":
-        try:
-            os.add_dll_directory(RFC_SDK_PATH)
-        except AttributeError:
-            os.environ["PATH"] = RFC_SDK_PATH + ";" + os.environ.get("PATH", "")
-    else:
-        os.environ["PATH"] = RFC_SDK_PATH + ":" + os.environ.get("PATH", "")
-
-# ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
 # Plant filter — AUFK.WERKS. Add multiple plants as needed.
-PLANTS: List[str] = ["1202"]
+PLANTS: List[str] = ["1102"]
 
 # Order type filter — AUFK.AUART. Leave [] for all PP order types.
 ORDER_TYPES: List[str] = []
 
+# Order categories (AUFK.AUTYP). MCP1 / SFIS covers production orders only;
+# without this filter, PM orders (category 30) of the plant were included.
+# 10 = production order, 40 = process order.
+ORDER_CATEGORIES: List[str] = ["10", "40"]
+
 # Date range on AUFK.ERDAT (order creation date) — format YYYYMMDD.
 # Matches the "01.01.2026 TO 28.02.2026" range shown in the PDF report header.
-DATE_FROM: str = os.getenv("DATE_FROM", "20260101")
-DATE_TO:   str = os.getenv("DATE_TO",   "20260228")
+DATE_FROM: str = os.getenv("DATE_FROM", "20261001")
+DATE_TO:   str = os.getenv("DATE_TO",   "20261031")
 
 # Optional secondary date filter on AFRU.BUDAT (confirmation posting date).
 # Leave both empty to skip — all confirmations for matching orders will be read.
@@ -180,6 +181,8 @@ def _to_days(value_str: str, unit_str: str) -> str:
 _AUFNR_SET: Set[str] = set()   # production order numbers  (AUFK  → AFKO)
 _AUFPL_SET: Set[str] = set()   # routing numbers           (AFKO  → AFVC / AFVV / AFRU)
 _ARBID_SET: Set[str] = set()   # work-centre object IDs    (AFVC  → CRHD)
+_PRCTR_SET: Set[str] = set()   # profit centre numbers     (AUFK  → CEPCT)
+_AUART_SET: Set[str] = set()   # order types               (AUFK  → T003P)
 
 # Active WHERE-syntax mode.
 _USE_IN_OPERATOR: bool = True
@@ -223,7 +226,7 @@ def _build_or_options(
     first_group = True
 
     while i < len(sorted_vals):
-        prefix = "( " if first_group else "OR ( "
+        prefix = "( ( " if first_group else "OR ( "
         row_parts: List[str] = []
         row_len = len(prefix)
 
@@ -238,6 +241,9 @@ def _build_or_options(
 
         options.append({"TEXT": prefix + " OR ".join(row_parts) + " )"})
         first_group = False
+
+    # Close the outer group, so the extra filter applies to every group
+    options.append({"TEXT": ")"})
 
     if extra:
         options.append({"TEXT": f"AND {extra}"})
@@ -266,7 +272,7 @@ def _build_in_options(
     i = 0
 
     while i < len(sorted_vals):
-        prefix   = f"{field_name} IN (" if first_clause else f"OR {field_name} IN ("
+        prefix   = f"( {field_name} IN (" if first_clause else f"OR {field_name} IN ("
         max_fill = 72 - len(prefix) - 1
         row_vals: List[str] = []
         row_len = 0
@@ -282,6 +288,9 @@ def _build_in_options(
 
         options.append({"TEXT": prefix + ",".join(row_vals) + ")"})
         first_clause = False
+
+    # Close the group opened on the first row (AND binds tighter than OR in ABAP)
+    options.append({"TEXT": ")"})
 
     if extra:
         options.append({"TEXT": f"AND {extra}"})
@@ -303,6 +312,10 @@ def _build_aufk_options() -> List[Dict[str, str]]:
             types_str = ",".join(f"'{t}'" for t in ORDER_TYPES)
             where += f" AND AUART IN ({types_str})"
 
+        if ORDER_CATEGORIES:
+            cats_str = ",".join(f"'{c}'" for c in ORDER_CATEGORIES)
+            where += f" AND AUTYP IN ({cats_str})"
+
         if DATE_FROM:
             where += f" AND ERDAT GE '{DATE_FROM}'"
         if DATE_TO:
@@ -319,6 +332,10 @@ def _build_aufk_options() -> List[Dict[str, str]]:
     if ORDER_TYPES:
         type_clauses = " OR ".join(f"AUART = '{t}'" for t in ORDER_TYPES)
         options.append({"TEXT": f"AND ( {type_clauses} )"})
+
+    if ORDER_CATEGORIES:
+        cat_clauses = " OR ".join(f"AUTYP = '{c}'" for c in ORDER_CATEGORIES)
+        options.append({"TEXT": f"AND ( {cat_clauses} )"})
 
     if DATE_FROM:
         options.append({"TEXT": f"AND ERDAT GE '{DATE_FROM}'"})
@@ -383,6 +400,8 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         "primary_keys": ["AUFNR"],
         "key_out": {
             "AUFNR": "_AUFNR_SET",
+            "PRCTR": "_PRCTR_SET",
+            "AUART": "_AUART_SET",
         },
         "is_anchor": True,
     },
@@ -504,6 +523,7 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
             "GMNGA",   # Confirmed yield quantity
             "LMNGA",   # Confirmed scrap quantity
             "STOKZ",   # Reversal indicator (filter = '' → active confirmations)
+            "STZHL",   # Counter of the cancelled confirmation (filled = reversal document)
             "ERSDA",   # Date record was created
         ],
         "options_fn": _build_afru_options,
@@ -532,6 +552,77 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         "options_fn": lambda: _build_in_options("OBJID", _ARBID_SET),
         "primary_keys": ["OBJID", "BEGDA"],
     },
+    {
+        "table": "CEPCT",
+        "description": "Profit Centre Text Table",
+        "columns": [
+            "SPRAS",   # Language Key
+            "PRCTR",   # Profit Centre
+            "DATBI",   # Valid-to Date
+            "KOKRS",   # Controlling Area
+            "LTEXT",   # Long Text
+            "MCTXT",   # Profit Centre Text
+        ],
+        "options_fn": lambda: _build_in_options("PRCTR", {p for p in _PRCTR_SET if p}, extra=f"SPRAS = '{LANGUAGE}'"),
+        "primary_keys": ["SPRAS", "PRCTR", "DATBI", "KOKRS"],
+    },
+    # ── PASS 8 ─ T003P : Order Types ──────────────────────────────────────
+    # Resolves AUART from AUFK to human-readable Order Type description (TXT).
+    # Driven by _AUART_SET collected from AUFK.
+    {
+        "table": "T003P",
+        "description": "Order Types",
+        "columns": [
+            "AUART",   # Order Type
+            "TXT",     # Description / Order Type Text
+            "SPRAS",   # Language Key
+        ],
+        "options_fn": lambda: _build_in_options(
+            "AUART",
+            {a for a in _AUART_SET if a},
+            extra=f"SPRAS = '{LANGUAGE}'"
+        ),
+        "primary_keys": ["SPRAS", "AUART"],
+    },
+
+    # ==========================================================
+    # S022 — SFIS: Order Operation Data for Work Center (source of MCP1)
+    # One row per order operation. Holds SAP's own target / actual
+    # execution times (factory calendar based) and confirmed quantities.
+    # Filtered by the collected order numbers + actual version 000.
+    # ==========================================================
+    {
+        "table": "S022",
+        "description": "SFIS Order Operation Data (MCP1 key figures)",
+        "columns": [
+            "AUFNR",   # Order number                      (join key)
+            "VORNR",   # Activity / operation number       (join key)
+            "POSNR",   # Order item number
+            "PLNFL",   # Sequence
+            "VRSIO",   # Version (000 = actual)
+            "SSOUR",   # Statistics origin
+            "SPTAG",   # Period to analyse - day
+            "WERKS",   # Plant
+            "ARBPL",   # Work centre
+            "MATNR",   # Material
+            "S_DFZ",   # Target execution time            → TgtLeadTm.
+            "I_DFZ",   # Actual execution time            → ActLeadTm.
+            "DFZEH",   # Unit of execution time
+            "BEARZ",   # Scheduled processing time
+            "BEAZE",   # Unit of processing time
+            "MGVRG",   # Operation total quantity
+            "LMNGA",   # Total confirmed yield
+            "XMNGA",   # Total scrap quantity confirmed   → Conf. Scrap Qty
+            "GMNGA",   # Confirmed yield in order unit
+            "ISDD",    # Actual execution start date
+            "IEDD",    # Actual execution end date
+            "MEINH",   # Unit of measure for activity 
+        ],
+        "options_fn": lambda: _build_in_options(
+            "AUFNR", _AUFNR_SET, extra="VRSIO = '000'"
+        ),
+        "primary_keys": ["AUFNR", "VORNR", "SPTAG"],
+    },
 ]
 
 
@@ -548,16 +639,16 @@ _POST_PROCESS_REGISTRY: Dict[str, Any] = {}
 # ---------------------------------------------------------------------------
 @dataclass
 class ExtractionConfig:
-    batch_size:       int   = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "5000")))
+    batch_size:       int   = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "100000")))
     max_buffer_width: int   = field(default_factory=lambda: int(os.getenv("MAX_BUFFER_WIDTH", "480")))
     max_retries:      int   = field(default_factory=lambda: int(os.getenv("MAX_RETRIES",      "3")))
     retry_delay_s:    float = field(default_factory=lambda: float(os.getenv("RETRY_DELAY_S",  "5")))
     commit_every:     int   = field(default_factory=lambda: int(os.getenv("COMMIT_EVERY",     "100000")))
-    staging_schema:   str   = field(default_factory=lambda: os.getenv("STAGING_SCHEMA_ECC",   "sap_stg_ecc"))
+    staging_schema:   str   = field(default_factory=lambda: get_postgres_schema(SAP_SYSTEM))
 
     def __post_init__(self) -> None:
-        if self.batch_size > 10_000:
-            raise ValueError("batch_size should not exceed 10 000 for RFC stability.")
+        if self.batch_size > 100_000:
+            raise ValueError("batch_size should not exceed 100 000 for RFC stability.")
         if self.max_buffer_width > 512:
             raise ValueError("max_buffer_width cannot exceed SAP RFC limit of 512.")
 
@@ -596,34 +687,11 @@ def _build_logger(run_id: str) -> logging.Logger:
 
 # ---------------------------------------------------------------------------
 # Environment / connection helpers
-# ---------------------------------------------------------------------------
-def _require_env(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
-        raise EnvironmentError(f"Required env var '{key}' is missing or empty.")
-    return val
-
-
-def build_sap_config() -> Dict[str, str]:
-    return {
-        "user":   _require_env("SAP_USER"),
-        "passwd": _require_env("SAP_PASSWORD"),
-        "ashost": _require_env("SAP_ASHOST"),
-        "sysnr":  _require_env("SAP_SYSNR"),
-        "client": _require_env("SAP_CLIENT"),
-        "lang":   os.getenv("SAP_LANG", "EN"),
-    }
-
-
-
-# ---------------------------------------------------------------------------
-# SAP connection wrapper — with RFC function fallback
-# ---------------------------------------------------------------------------
 class SAPConnection:
     """Wraps pyrfc.Connection and manages the active RFC read-table function."""
 
-    def __init__(self, config: Dict[str, str], log: logging.Logger) -> None:
-        self._cfg      = config
+    def __init__(self, system: str, log: logging.Logger) -> None:
+        self._system   = system
         self._log      = log
         self._fn_index = 0
         self.conn: Optional[Connection] = None
@@ -647,8 +715,8 @@ class SAPConnection:
     def _connect(self) -> None:
         for attempt in range(1, 4):
             try:
-                self._log.info("Connecting to SAP (attempt %d/3)...", attempt)
-                self.conn = Connection(**self._cfg)
+                self._log.info("Connecting to SAP %s (attempt %d/3)...", self._system, attempt)
+                self.conn = get_sap_connection(self._system)
                 self._log.info("SAP connection established.")
                 return
             except LogonError:
@@ -919,12 +987,10 @@ class BatchExtractor:
 class PostgresLoader:
     def __init__(
         self,
-        cfg:      Dict[str, Any],
         schema:   str,
         prefix:   str,
         log:      logging.Logger,
     ) -> None:
-        self._cfg    = cfg
         self._schema = schema
         self._prefix = prefix
         self._log    = log
@@ -934,7 +1000,7 @@ class PostgresLoader:
     def connect(self) -> None:
         self._log.info("Connecting to PostgreSQL...")
         try:
-            self.conn    = psycopg2.connect(**self._cfg)
+            self.conn    = get_postgres_connection()
             self._cursor = self.conn.cursor()
             self._log.info("PostgreSQL connection established.")
         except Exception:
@@ -942,15 +1008,15 @@ class PostgresLoader:
             raise
 
     def create_staging_table(self, sap_table: str, columns: List[str]) -> str:
-        stg_name  = f"stg_sap_{self._prefix.lower()}_{sap_table.lower()}"
+        stg_name  = f"stg_sap_mcp1_{sap_table.lower()}"
         safe_cols = [c.replace("-", "_").replace("/", "_").lower() for c in columns]
 
         self._cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema};")
 
         col_defs = ",\n    ".join([f'"{c}" TEXT' for c in safe_cols])
         ddl = f"""
-        DROP TABLE IF EXISTS {self._schema}.{stg_name};
-        CREATE TABLE {self._schema}.{stg_name} (
+        -- DROP TABLE IF EXISTS {self._schema}.{stg_name};
+        CREATE TABLE IF NOT EXISTS {self._schema}.{stg_name} (
             {col_defs},
             load_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             extraction_id UUID DEFAULT gen_random_uuid()
@@ -958,8 +1024,15 @@ class PostgresLoader:
         """
         self._log.info("Creating staging table %s.%s...", self._schema, stg_name)
         self._cursor.execute(ddl)
+        # CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+        # Add any new extraction column (e.g. AFRU.STZHL) so the INSERT does not fail.
+        for c in safe_cols:
+            self._cursor.execute(
+                f'ALTER TABLE {self._schema}.{stg_name} ADD COLUMN IF NOT EXISTS "{c}" TEXT;'
+            )
+        self._cursor.execute(f"TRUNCATE TABLE {self._schema}.{stg_name};")
         self.conn.commit()
-        self._log.info("Staging table %s.%s created.", self._schema, stg_name)
+        self._log.info("Staging table %s.%s created and truncated.", self._schema, stg_name)
         return f'"{self._schema}"."{stg_name}"'
 
     def load_batch(
@@ -1034,9 +1107,11 @@ def extract_table(
 
     rows_loaded       = 0
     rows_since_commit = 0
+    batch_count       = 0
     effective_cols    = columns  # updated after first post_process call
 
     for batch in extractor.batches():
+        batch_count += 1
         if key_out:
             _collect_keys(batch, columns, key_out, log)
 
@@ -1053,6 +1128,15 @@ def extract_table(
             rows_since_commit = 0
 
     loader.commit()
+
+    # Reads beyond one batch use ROWSKIPS paging, which is not order-stable
+    # and can duplicate or drop rows. Flag it loudly.
+    if batch_count > 1:
+        log.warning(
+            "[%s] Read in %d batches -- paging may duplicate or drop rows. "
+            "Narrow the date range or raise BATCH_SIZE.",
+            table, batch_count,
+        )
 
     elapsed = time.time() - t0
     rate    = rows_loaded / elapsed if elapsed > 0 else 0
@@ -1103,6 +1187,8 @@ def _probe_anchor_table(
         )
 
         _AUFNR_SET.clear()
+        _PRCTR_SET.clear()
+        _AUART_SET.clear()
 
         try:
             ok, count = extract_table(anchor_def, sap, loader, cfg, log)
@@ -1143,6 +1229,7 @@ def main() -> None:
     log.info("SAP MCP1 Production Order Operations Staging Pipeline  [run: %s]", run_id)
     log.info("Plants             : %s", PLANTS)
     log.info("Order types        : %s", ORDER_TYPES if ORDER_TYPES else "ALL")
+    log.info("Order categories   : %s", ORDER_CATEGORIES if ORDER_CATEGORIES else "ALL")
     log.info("Order date from    : %s", DATE_FROM        if DATE_FROM        else "unbounded")
     log.info("Order date to      : %s", DATE_TO          if DATE_TO          else "unbounded")
     log.info("Conf. date from    : %s", CONF_DATE_FROM   if CONF_DATE_FROM   else "unbounded")
@@ -1156,21 +1243,13 @@ def main() -> None:
 
     try:
         cfg        = ExtractionConfig()
-        sap_config = build_sap_config()
-        pg_config  = {
-            "host":     _require_env("PG_HOST"),
-            "port":     os.getenv("PG_PORT", "5432"),
-            "database": _require_env("PG_DATABASE"),
-            "user":     _require_env("PG_USER"),
-            "password": _require_env("PG_PASSWORD"),
-        }
     except (EnvironmentError, ValueError) as exc:
         log.critical("Configuration error: %s", exc)
         sys.exit(1)
 
     try:
-        sap    = SAPConnection(sap_config, log)
-        loader = PostgresLoader(pg_config, cfg.staging_schema, STAGING_PREFIX, log)
+        sap    = SAPConnection(SAP_SYSTEM, log)
+        loader = PostgresLoader(cfg.staging_schema, STAGING_PREFIX, log)
         loader.connect()
     except Exception:
         log.critical("Failed to establish connections — aborting.")
@@ -1215,6 +1294,8 @@ def main() -> None:
     log.info("    AUFNR : %d production order numbers", len(_AUFNR_SET))
     log.info("    AUFPL : %d routing numbers",          len(_AUFPL_SET))
     log.info("    ARBID : %d work-centre object IDs",   len(_ARBID_SET))
+    log.info("    PRCTR : %d profit centres",           len(_PRCTR_SET))
+    log.info("    AUART : %d order types",              len(_AUART_SET))
     log.info("Succeeded (%d):", len(succeeded))
     for tbl, count in succeeded:
         log.info("    %-20s  %d rows", tbl, count)
@@ -1233,4 +1314,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nExtraction cancelled by user.")
-        sys.exit(1)
+        sys.exi
