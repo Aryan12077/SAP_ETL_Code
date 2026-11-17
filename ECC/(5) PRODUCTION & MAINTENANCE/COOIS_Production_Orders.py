@@ -26,6 +26,7 @@
 #   Pass 4 — MAKT : Material descriptions (short texts).
 #   Pass 5 — JEST : Individual object statuses (active only).
 #   Pass 6 — TJ02T: System status texts (short + long).
+#   Pass 7 — CEPCT: Profit centre text table (short/long text). Driven by PRCTR set.
 
 # Fallback behaviour (mirrors IH08 extractor pattern)
 # ----------------------------------------------------
@@ -50,31 +51,29 @@
 # from __future__ import annotations
 
 # import os
-# import platform
-
-# # -------------------------------------------------------------
-# # PostgreSQL DLL handling (required for Python 3.8+ on Windows)
-# # Replace the path below with your actual PostgreSQL bin path.
-# # -------------------------------------------------------------
-# pg_bin_path = r"C:\Program Files\PostgreSQL\18\bin"
-
-# if platform.system() == "Windows":
-#     if os.path.exists(pg_bin_path):
-#         os.add_dll_directory(pg_bin_path)
-#     # Also point to the current script directory where DLLs may be copied.
-#     os.add_dll_directory(os.getcwd())
-
-# import logging
 # import sys
-# import time
-# from dataclasses import dataclass, field
-# from datetime import datetime
+
+# _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# for _p in (_THIS_DIR, os.path.dirname(_THIS_DIR), os.path.dirname(os.path.dirname(_THIS_DIR))):
+#     if _p not in sys.path:
+#         sys.path.append(_p)
+
+# # connections.py must be imported BEFORE pyrfc / psycopg2 (.env + DLL paths)
+# from connections import (  # noqa: E402
+#     get_postgres_connection,
+#     get_postgres_schema,
+#     get_sap_connection,
+# )
+
+# import logging  # noqa: E402
+# import time  # noqa: E402
+# from dataclasses import dataclass, field  # noqa: E402
+# from datetime import datetime  # noqa: E402
 # from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
-# import psycopg2
-# from psycopg2 import extras
-# from dotenv import load_dotenv
-# from pyrfc import (
+# import psycopg2  # noqa: E402
+# from psycopg2 import extras  # noqa: E402
+# from pyrfc import (  # noqa: E402
 #     ABAPApplicationError,
 #     ABAPRuntimeError,
 #     CommunicationError,
@@ -82,20 +81,7 @@
 #     LogonError,
 # )
 
-# # ---------------------------------------------------------------------------
-# # RFC SDK registration
-# # ---------------------------------------------------------------------------
-# load_dotenv()
-
-# RFC_SDK_PATH = os.getenv("RFC_SDK_PATH", r"C:\nwrfcsdk\lib")
-# if os.path.isdir(RFC_SDK_PATH):
-#     if sys.platform == "win32":
-#         try:
-#             os.add_dll_directory(RFC_SDK_PATH)
-#         except AttributeError:
-#             os.environ["PATH"] = RFC_SDK_PATH + ";" + os.environ.get("PATH", "")
-#     else:
-#         os.environ["PATH"] = RFC_SDK_PATH + ":" + os.environ.get("PATH", "")
+# SAP_SYSTEM: str = "ECC"
 
 # # ---------------------------------------------------------------------------
 # # CONFIGURATION
@@ -103,7 +89,7 @@
 
 # # Plant filter — AUFK.WERKS. Use [""] to match blank plant or all plants
 # # if your RFC variant ignores empty strings.  Set e.g. ["D001"] to restrict.
-# PLANTS: List[str] = ["1202"]
+# PLANTS: List[str] = [p.strip() for p in (os.getenv("PLANTS") or "1202").split(",") if p.strip()]
 
 # # Order type filter — AUFK.AUART.  Leave [] for all types.
 # # Common PP types: PP01 = standard production, PP02 = repetitive, etc.
@@ -111,8 +97,8 @@
 
 # # Date range on AUFK.ERDAT (order creation date) — format YYYYMMDD
 # # Set both to "" to disable the date filter entirely.
-# DATE_FROM: str = os.getenv("DATE_FROM", "20251001")   # e.g. "20260101"
-# DATE_TO:   str = os.getenv("DATE_TO",   "20251231")   # e.g. "20260228"
+# DATE_FROM: str = os.getenv("DATE_FROM", "20260101")   # e.g. "20260101"
+# DATE_TO:   str = os.getenv("DATE_TO",   "20260131")   # e.g. "20260228"
 
 # # Language key for MAKT and TJ02T text lookups
 # LANGUAGE: str = "E"
@@ -133,6 +119,7 @@
 # _OBJNR_SET: Set[str] = set()   # object numbers            (AUFK → JEST)
 # _MATNR_SET: Set[str] = set()   # material numbers          (AFPO → MAKT)
 # _STAT_SET:  Set[str] = set()   # active status codes       (JEST → TJ02T)
+# _PRCTR_SET: Set[str] = set()   # profit centre numbers     (AUFK → CEPCT)
 
 # # Active WHERE-syntax mode.
 # # True  → use IN ('a','b','c')
@@ -338,6 +325,7 @@
 #         "key_out": {
 #             "AUFNR": "_AUFNR_SET",
 #             "OBJNR": "_OBJNR_SET",
+#             "PRCTR": "_PRCTR_SET",
 #         },
 #         "is_anchor": True,
 #     },
@@ -448,6 +436,28 @@
 #         ),
 #         "primary_keys": ["ISTAT", "SPRAS"],
 #     },
+#     # ── PASS 7 ─ CEPCT : Profit Centre Text Table ──────────────────────────
+#     # Resolves PRCTR from AUFK to human-readable Profit Centre names.
+#     # Driven by _PRCTR_SET collected from AUFK.
+#     {
+#         "table": "CEPCT",
+#         "description": "Profit Centre Text Table",
+#         "columns": [
+#             "SPRAS",   # Language Key
+#             "PRCTR",   # Profit Centre
+#             "DATBI",   # Valid-to Date
+#             "KOKRS",   # Controlling Area
+#             "KTEXT",   # Profit Centre Name / Short Text
+#             "LTEXT",   # Long Text
+#             "MCTXT",   # Search term / Matchcode text
+#         ],
+#         "options_fn": lambda: _build_in_options(
+#             "PRCTR",
+#             {p for p in _PRCTR_SET if p},
+#             extra=f"SPRAS = '{LANGUAGE}'"
+#         ),
+#         "primary_keys": ["SPRAS", "PRCTR", "DATBI", "KOKRS"],
+#     },
 # ]
 
 # # ---------------------------------------------------------------------------
@@ -460,7 +470,7 @@
 #     max_retries:      int   = field(default_factory=lambda: int(os.getenv("MAX_RETRIES",      "3")))
 #     retry_delay_s:    float = field(default_factory=lambda: float(os.getenv("RETRY_DELAY_S",  "5")))
 #     commit_every:     int   = field(default_factory=lambda: int(os.getenv("COMMIT_EVERY",     "100000")))
-#     staging_schema:   str   = field(default_factory=lambda: os.getenv("STAGING_SCHEMA_ECC",   "sap_stg_ecc"))
+#     staging_schema:   str   = field(default_factory=lambda: get_postgres_schema(SAP_SYSTEM))
 
 #     def __post_init__(self) -> None:
 #         if self.batch_size > 10_000:
@@ -500,27 +510,6 @@
 #     return log
 
 # # ---------------------------------------------------------------------------
-# # Environment / connection helpers
-# # ---------------------------------------------------------------------------
-# def _require_env(key: str) -> str:
-#     val = os.getenv(key)
-#     if not val:
-#         raise EnvironmentError(f"Required env var '{key}' is missing or empty.")
-#     return val
-
-
-# def build_sap_config() -> Dict[str, str]:
-#     return {
-#         "user":   _require_env("SAP_USER"),
-#         "passwd": _require_env("SAP_PASSWORD"),
-#         "ashost": _require_env("SAP_ASHOST"),
-#         "sysnr":  _require_env("SAP_SYSNR"),
-#         "client": _require_env("SAP_CLIENT"),
-#         "lang":   os.getenv("SAP_LANG", "EN"),
-#     }
-
-
-# # ---------------------------------------------------------------------------
 # # SAP connection wrapper — with RFC function fallback
 # # ---------------------------------------------------------------------------
 # class SAPConnection:
@@ -531,8 +520,8 @@
 #     switch_rfc_function() to advance to the next candidate.
 #     """
 
-#     def __init__(self, config: Dict[str, str], log: logging.Logger) -> None:
-#         self._cfg      = config
+#     def __init__(self, system: str, log: logging.Logger) -> None:
+#         self._system   = system
 #         self._log      = log
 #         self._fn_index = 0
 #         self.conn: Optional[Connection] = None
@@ -556,8 +545,8 @@
 #     def _connect(self) -> None:
 #         for attempt in range(1, 4):
 #             try:
-#                 self._log.info("Connecting to SAP (attempt %d/3)...", attempt)
-#                 self.conn = Connection(**self._cfg)
+#                 self._log.info("Connecting to SAP %s (attempt %d/3)...", self._system, attempt)
+#                 self.conn = get_sap_connection(self._system)
 #                 self._log.info("SAP connection established.")
 #                 return
 #             except LogonError:
@@ -822,12 +811,10 @@
 # class PostgresLoader:
 #     def __init__(
 #         self,
-#         cfg:      Dict[str, Any],
 #         schema:   str,
 #         prefix:   str,
 #         log:      logging.Logger,
 #     ) -> None:
-#         self._cfg    = cfg
 #         self._schema = schema
 #         self._prefix = prefix
 #         self._log    = log
@@ -837,7 +824,7 @@
 #     def connect(self) -> None:
 #         self._log.info("Connecting to PostgreSQL...")
 #         try:
-#             self.conn    = psycopg2.connect(**self._cfg)
+#             self.conn    = get_postgres_connection()
 #             self._cursor = self.conn.cursor()
 #             self._log.info("PostgreSQL connection established.")
 #         except Exception:
@@ -845,24 +832,30 @@
 #             raise
 
 #     def create_staging_table(self, sap_table: str, columns: List[str]) -> str:
-#         stg_name  = f"stg_sap_{self._prefix.lower()}_{sap_table.lower()}"
+#         stg_name  = f"stg_sap_coois_{sap_table.lower()}"
 #         safe_cols = [c.replace("-", "_").replace("/", "_").lower() for c in columns]
 
 #         self._cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema};")
 
-#         col_defs = ",\n    ".join([f'"{c}" TEXT' for c in safe_cols])
-#         ddl = f"""
-#         DROP TABLE IF EXISTS {self._schema}.{stg_name};
-#         CREATE TABLE {self._schema}.{stg_name} (
+#         col_defs = ",\n            ".join([f'"{c}" TEXT' for c in safe_cols])
+
+#         # Create the table only if it doesn't already exist
+#         ddl_create = f"""
+#         CREATE TABLE IF NOT EXISTS {self._schema}.{stg_name} (
 #             {col_defs},
 #             load_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 #             extraction_id UUID DEFAULT gen_random_uuid()
 #         );
 #         """
-#         self._log.info("Creating staging table %s.%s...", self._schema, stg_name)
-#         self._cursor.execute(ddl)
+
+#         self._log.info("Preparing staging table %s.%s...", self._schema, stg_name)
+#         self._cursor.execute(ddl_create)
+
+#         # Truncate to wipe previous run data
+#         self._cursor.execute(f"TRUNCATE TABLE {self._schema}.{stg_name};")
 #         self.conn.commit()
-#         self._log.info("Staging table %s.%s created.", self._schema, stg_name)
+
+#         self._log.info("Staging table %s.%s truncated and ready.", self._schema, stg_name)
 #         return f'"{self._schema}"."{stg_name}"'
 
 #     def load_batch(
@@ -996,6 +989,7 @@
 #         # Clear anchor key sets so a retry starts fresh
 #         _AUFNR_SET.clear()
 #         _OBJNR_SET.clear()
+#         _PRCTR_SET.clear()
 
 #         try:
 #             ok, count = extract_table(anchor_def, sap, loader, cfg, log)
@@ -1044,22 +1038,14 @@
 #     log.info("=" * 60)
 
 #     try:
-#         cfg        = ExtractionConfig()
-#         sap_config = build_sap_config()
-#         pg_config  = {
-#             "host":     _require_env("PG_HOST"),
-#             "port":     os.getenv("PG_PORT", "5432"),
-#             "database": _require_env("PG_DATABASE"),
-#             "user":     _require_env("PG_USER"),
-#             "password": _require_env("PG_PASSWORD"),
-#         }
+#         cfg = ExtractionConfig()
 #     except (EnvironmentError, ValueError) as exc:
 #         log.critical("Configuration error: %s", exc)
 #         sys.exit(1)
 
 #     try:
-#         sap    = SAPConnection(sap_config, log)
-#         loader = PostgresLoader(pg_config, cfg.staging_schema, STAGING_PREFIX, log)
+#         sap    = SAPConnection(SAP_SYSTEM, log)
+#         loader = PostgresLoader(cfg.staging_schema, STAGING_PREFIX, log)
 #         loader.connect()
 #     except Exception:
 #         log.critical("Failed to establish connections — aborting.")
@@ -1105,6 +1091,7 @@
 #     log.info("    OBJNR : %d object numbers",           len(_OBJNR_SET))
 #     log.info("    MATNR : %d material numbers",         len(_MATNR_SET))
 #     log.info("    STAT  : %d active status codes",      len(_STAT_SET))
+#     log.info("    PRCTR : %d profit centres",           len(_PRCTR_SET))
 #     log.info("Succeeded (%d):", len(succeeded))
 #     for tbl, count in succeeded:
 #         log.info("    %-20s  %d rows", tbl, count)
@@ -1125,6 +1112,7 @@
 #         print("\nExtraction cancelled by user.")
 #         sys.exit(1)
 
+#new code as on 16-11-2026
 """
 SAP COOIS — Production Order Information System Staging Extractor
 =================================================================
@@ -1173,6 +1161,24 @@ Date filter
   Set DATE_FROM / DATE_TO as YYYYMMDD strings (or env vars).
   Leave DATE_FROM empty ("") to skip the lower date boundary.
   Leave DATE_TO   empty ("") to skip the upper date boundary.
+
+Change log
+----------
+1.1.0 (ECC)  Fixes ported from the validated SAP HANA extractors:
+  v1.1-A  WHERE builders: IN / OR groups wrapped in brackets, so
+          'AND INACT = ''' / 'SPRAS' / 'WRTTP' / 'STOKZ' apply to every
+          group, not only the last one (pitfall P1).
+  v1.1-B  BATCH_SIZE default 100,000, 10,000 cap removed, WARNING when a
+          table needs more than one RFC call (ROWSKIPS paging, pitfall P2).
+  v1.1-C  Loader adds missing configured columns to existing staging
+          tables (ADD COLUMN IF NOT EXISTS) before TRUNCATE.
+  v1.1-H  Commented-out copy of the old script removed.
+  v1.1-I  Default DATE_FROM/DATE_TO = 20261001-20261031 (the orchestrator
+          passes its own 15-day window).
+  v1.1-D  AUFK: new field AUTYP, filter ORDER_CATEGORIES = ['10'].
+          Before, PM orders (category 30) were staged as well.
+  v1.1-E  New pass T003P (order type texts) - replaces the hardcoded
+          PP01/PP02 CASE in the query.
 """
 
 from __future__ import annotations
@@ -1222,10 +1228,15 @@ PLANTS: List[str] = [p.strip() for p in (os.getenv("PLANTS") or "1202").split(",
 # Common PP types: PP01 = standard production, PP02 = repetitive, etc.
 ORDER_TYPES: List[str] = []
 
+# >>> CHANGED (v1.1-D): order category filter (AUFK.AUTYP).
+# COOIS = production orders only (30 = PM -> IW39, 40 = process -> COOISPI).
+# Values: '10' production, '20' network, '30' PM, '40' process order.
+ORDER_CATEGORIES: List[str] = ['10']
+
 # Date range on AUFK.ERDAT (order creation date) — format YYYYMMDD
 # Set both to "" to disable the date filter entirely.
-DATE_FROM: str = os.getenv("DATE_FROM", "20260101")   # e.g. "20260101"
-DATE_TO:   str = os.getenv("DATE_TO",   "20260131")   # e.g. "20260228"
+DATE_FROM: str = os.getenv("DATE_FROM", "20261001")   # e.g. "20260101"
+DATE_TO:   str = os.getenv("DATE_TO",   "20261031")   # e.g. "20260228"
 
 # Language key for MAKT and TJ02T text lookups
 LANGUAGE: str = "E"
@@ -1298,7 +1309,7 @@ def _build_or_options(
     first_group = True
 
     while i < len(sorted_vals):
-        prefix = "( " if first_group else "OR ( "
+        prefix = "( ( " if first_group else "OR ( "
         row_parts: List[str] = []
         row_len = len(prefix)
 
@@ -1313,6 +1324,9 @@ def _build_or_options(
 
         options.append({"TEXT": prefix + " OR ".join(row_parts) + " )"})
         first_group = False
+
+    # >>> CHANGED (v1.1-A): outer bracket around the whole OR chain.
+    options.append({"TEXT": ")"})
 
     if extra:
         options.append({"TEXT": f"AND {extra}"})
@@ -1345,7 +1359,7 @@ def _build_in_options(
     i = 0
 
     while i < len(sorted_vals):
-        prefix   = f"{field_name} IN (" if first_clause else f"OR {field_name} IN ("
+        prefix   = f"( {field_name} IN (" if first_clause else f"OR {field_name} IN ("
         max_fill = 72 - len(prefix) - 1
         row_vals: List[str] = []
         row_len = 0
@@ -1361,6 +1375,10 @@ def _build_in_options(
 
         options.append({"TEXT": prefix + ",".join(row_vals) + ")"})
         first_clause = False
+
+    # >>> CHANGED (v1.1-A): close the group opened on the first row so the
+    # extra filter applies to EVERY IN group (AND binds tighter than OR).
+    options.append({"TEXT": ")"})
 
     if extra:
         options.append({"TEXT": f"AND {extra}"})
@@ -1384,6 +1402,10 @@ def _build_aufk_options() -> List[Dict[str, str]]:
         plants_str = ",".join(f"'{p}'" for p in PLANTS)
         where = f"WERKS IN ({plants_str})"
 
+        if ORDER_CATEGORIES:
+            cats_str = ",".join(f"'{c}'" for c in ORDER_CATEGORIES)
+            where += f" AND AUTYP IN ({cats_str})"
+
         if ORDER_TYPES:
             types_str = ",".join(f"'{t}'" for t in ORDER_TYPES)
             where += f" AND AUART IN ({types_str})"
@@ -1401,6 +1423,10 @@ def _build_aufk_options() -> List[Dict[str, str]]:
 
     plant_clauses = " OR ".join(f"WERKS = '{p}'" for p in PLANTS)
     options.append({"TEXT": f"( {plant_clauses} )"})
+
+    if ORDER_CATEGORIES:
+        cat_clauses = " OR ".join(f"AUTYP = '{c}'" for c in ORDER_CATEGORIES)
+        options.append({"TEXT": f"AND ( {cat_clauses} )"})
 
     if ORDER_TYPES:
         type_clauses = " OR ".join(f"AUART = '{t}'" for t in ORDER_TYPES)
@@ -1439,6 +1465,7 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         "columns": [
             "AUFNR",   # Production order number
             "AUART",   # Order type
+            "AUTYP",   # Order category   >>> CHANGED (v1.1-D)
             "WERKS",   # Plant
             "ERDAT",   # Created on
             "KTEXT",   # Order description / short text
@@ -1585,6 +1612,21 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         ),
         "primary_keys": ["SPRAS", "PRCTR", "DATBI", "KOKRS"],
     },
+
+    # ── >>> CHANGED (v1.1-E): T003P : Order type texts ────────────────────
+    # Replaces hardcoded order-type CASE mappings in the SQL query.
+    # Small customizing table: filtered by language only.
+    {
+        "table": "T003P",
+        "description": "Order Type Texts",
+        "columns": [
+            "AUART",   # Order type                  (join key -> AUFK.AUART)
+            "SPRAS",   # Language key
+            "TXT",     # Order type text
+        ],
+        "options_fn": lambda: _format_options(f"SPRAS = '{LANGUAGE}'"),
+        "primary_keys": ["SPRAS", "AUART"],
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -1592,7 +1634,7 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 @dataclass
 class ExtractionConfig:
-    batch_size:       int   = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "10000")))
+    batch_size:       int   = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "100000")))
     max_buffer_width: int   = field(default_factory=lambda: int(os.getenv("MAX_BUFFER_WIDTH", "480")))
     max_retries:      int   = field(default_factory=lambda: int(os.getenv("MAX_RETRIES",      "3")))
     retry_delay_s:    float = field(default_factory=lambda: float(os.getenv("RETRY_DELAY_S",  "5")))
@@ -1600,8 +1642,9 @@ class ExtractionConfig:
     staging_schema:   str   = field(default_factory=lambda: get_postgres_schema(SAP_SYSTEM))
 
     def __post_init__(self) -> None:
-        if self.batch_size > 10_000:
-            raise ValueError("batch_size should not exceed 10 000 for RFC stability.")
+        # >>> CHANGED (v1.1-B): 10,000 cap removed. ROWSKIPS paging is not
+        # order-stable (duplicate AND missing rows), so each table should be
+        # read in ONE call; keep windows small (orchestrator: 15 days).
         if self.max_buffer_width > 512:
             raise ValueError("max_buffer_width cannot exceed SAP RFC limit of 512.")
 
@@ -1870,6 +1913,7 @@ class BatchExtractor:
     def batches(self) -> Generator[List[List[Any]], None, None]:
         offset = 0
         total  = 0
+        n_batches = 0
 
         while True:
             batch = self._fetch_offset(offset)
@@ -1880,6 +1924,14 @@ class BatchExtractor:
                 break
 
             total  += len(batch)
+            n_batches += 1
+            if n_batches == 2:
+                # >>> CHANGED (v1.1-B): paging risk warning
+                self._log.warning(
+                    "[%s] Read in more than one batch (BATCH_SIZE=%d). ROWSKIPS "
+                    "paging can duplicate or drop rows - shorten the date window.",
+                    self._table, self._cfg.batch_size,
+                )
             offset += self._cfg.batch_size
             self._log.info(
                 "[%s] Fetched %d rows (running total: %d).",
@@ -1979,6 +2031,14 @@ class PostgresLoader:
         self._cursor.execute(ddl_create)
 
         # Truncate to wipe previous run data
+        # >>> CHANGED (v1.1-C): add any configured column missing from an existing
+        # table (new fields like AUTYP / STZHL / MEINH need no manual DDL).
+        self._cursor.execute(
+            f"ALTER TABLE {self._schema}.{stg_name} "
+            + ", ".join(f'ADD COLUMN IF NOT EXISTS "{c}" TEXT' for c in safe_cols)
+            + ";"
+        )
+
         self._cursor.execute(f"TRUNCATE TABLE {self._schema}.{stg_name};")
         self.conn.commit()
 
@@ -2156,6 +2216,7 @@ def main() -> None:
     log.info("SAP COOIS Production Order Staging Pipeline  [run: %s]", run_id)
     log.info("Plants         : %s", PLANTS)
     log.info("Order types    : %s", ORDER_TYPES if ORDER_TYPES else "ALL")
+    log.info("Order category : %s", ORDER_CATEGORIES if ORDER_CATEGORIES else "ALL")
     log.info("Date from      : %s", DATE_FROM   if DATE_FROM   else "unbounded")
     log.info("Date to        : %s", DATE_TO     if DATE_TO     else "unbounded")
     log.info("Language       : %s", LANGUAGE)

@@ -110,7 +110,7 @@
 # DATE_TO   = os.getenv("DATE_TO",   "20260630")
 
 # # Maintenance planning plant(s) — applied to AUFK.WERKS
-# PLANTS: List[str] = ["1202"]
+# PLANTS: List[str] = [p.strip() for p in (os.getenv("PLANTS") or "1202").split(",") if p.strip()]
 
 # # Order types to include — leave empty [] for all PM order types.
 # # Typical PM types: PM01=Corrective, PM02=Breakdown, ZPM3=Preventive
@@ -831,24 +831,30 @@
 #             raise
 
 #     def create_staging_table(self, sap_table: str, columns: List[str]) -> str:
-#         stg_name  = f"stg_sap_{self._prefix.lower()}_{sap_table.lower()}"
+#         stg_name  = f"stg_sap_iw39_{sap_table.lower()}"
 #         safe_cols = [c.replace("-", "_").replace("/", "_").lower() for c in columns]
 
 #         self._cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema};")
 
-#         col_defs = ",\n    ".join([f'"{c}" TEXT' for c in safe_cols])
-#         ddl = f"""
-#         DROP TABLE IF EXISTS {self._schema}.{stg_name};
-#         CREATE TABLE {self._schema}.{stg_name} (
+#         col_defs = ",\n            ".join([f'"{c}" TEXT' for c in safe_cols])
+
+#         # Create the table only if it doesn't already exist
+#         ddl_create = f"""
+#         CREATE TABLE IF NOT EXISTS {self._schema}.{stg_name} (
 #             {col_defs},
 #             load_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 #             extraction_id UUID DEFAULT gen_random_uuid()
 #         );
 #         """
-#         self._log.info("Creating staging table %s.%s...", self._schema, stg_name)
-#         self._cursor.execute(ddl)
+
+#         self._log.info("Preparing staging table %s.%s...", self._schema, stg_name)
+#         self._cursor.execute(ddl_create)
+
+#         # Truncate to wipe previous run data
+#         self._cursor.execute(f"TRUNCATE TABLE {self._schema}.{stg_name};")
 #         self.conn.commit()
-#         self._log.info("Staging table %s.%s created.", self._schema, stg_name)
+
+#         self._log.info("Staging table %s.%s truncated and ready.", self._schema, stg_name)
 #         return f'"{self._schema}"."{stg_name}"'
 
 #     def load_batch(
@@ -1021,6 +1027,7 @@
 #         print("\nExtraction cancelled by user.")
 #         sys.exit(1)
 
+#new code as on 16-11-2026
 """
 SAP IW39 Display PM Orders — Staging Extractor
 ===============================================
@@ -1038,6 +1045,7 @@ IW39 Report Column → SAP Field Mapping
 -----------------------------------------
 Bas. start date    (Basic Start Date)       → AFKO.GSTRP
 Order Type                                  → AUFK.AUART
+Order Type Text                             → T003P.TXT
 Order              (Order Number)           → AUFK.AUFNR
 Equipment                                   → AFIH.EQUNR
 Description        (Order Short Text)       → AUFK.KTEXT
@@ -1085,7 +1093,25 @@ IW39 vs IW38 configuration notes:
     with IW38 staging tables if both pipelines run in the same database.
 
 Author  : [Your Name]
-Version : 1.0.0
+Version : 1.1.0 (ECC)
+
+Change log
+----------
+1.1.0 (ECC)  Fixes ported from the validated SAP HANA extractors:
+  v1.1-A  WHERE builders: IN / OR groups wrapped in brackets, so
+          'AND INACT = ''' / 'SPRAS' / 'WRTTP' / 'STOKZ' apply to every
+          group, not only the last one (pitfall P1).
+  v1.1-B  BATCH_SIZE default 100,000, 10,000 cap removed, WARNING when a
+          table needs more than one RFC call (ROWSKIPS paging, pitfall P2).
+  v1.1-C  Loader adds missing configured columns to existing staging
+          tables (ADD COLUMN IF NOT EXISTS) before TRUNCATE.
+  v1.1-H  Commented-out copy of the old script removed.
+  v1.1-I  Default DATE_FROM/DATE_TO = 20261001-20261031 (the orchestrator
+          passes its own 15-day window).
+  v1.1-E  New pass T003P (order type texts) - use in the query instead
+          of a hardcoded CASE. Needs table stg_sap_iw39_t003p.
+  NOTE    ORDER_TYPES = PM01/PM02/ZPM3 and ORDER_CATEGORIES = [] are
+          ECC settings - confirm in SE16N AUFK for the ECC plant.
 """
 
 from __future__ import annotations
@@ -1129,8 +1155,8 @@ SAP_SYSTEM: str = "ECC"
 # -------------------------------------------------------------
 
 # Order creation date range applied to AUFK.ERDAT
-DATE_FROM = os.getenv("DATE_FROM", "20260101")
-DATE_TO   = os.getenv("DATE_TO",   "20260630")
+DATE_FROM = os.getenv("DATE_FROM", "20261001")
+DATE_TO   = os.getenv("DATE_TO",   "20261031")
 
 # Maintenance planning plant(s) — applied to AUFK.WERKS
 PLANTS: List[str] = [p.strip() for p in (os.getenv("PLANTS") or "1202").split(",") if p.strip()]
@@ -1214,7 +1240,7 @@ def _build_in_options(
     i = 0
 
     while i < len(sorted_vals):
-        prefix      = f"{field_name} IN (" if first_clause else f"OR {field_name} IN ("
+        prefix      = f"( {field_name} IN (" if first_clause else f"OR {field_name} IN ("
         max_content = 72 - len(prefix) - 1
         row_vals: List[str] = []
         row_len = 0
@@ -1230,6 +1256,10 @@ def _build_in_options(
 
         options.append({"TEXT": prefix + ",".join(row_vals) + ")"})
         first_clause = False
+
+    # >>> CHANGED (v1.1-A): close the group opened on the first row so the
+    # extra filter applies to EVERY IN group (AND binds tighter than OR).
+    options.append({"TEXT": ")"})
 
     if extra:
         options.append({"TEXT": f"AND {extra}"})
@@ -1496,6 +1526,21 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
         "options_fn": _build_pmco_options,
         "primary_keys": ["OBJNR", "GJAHR", "ACPOS", "VERSN"],
     },
+
+    # ── >>> CHANGED (v1.1-E): T003P : Order type texts ────────────────────
+    # Replaces hardcoded order-type CASE mappings in the SQL query.
+    # Small customizing table: filtered by language only.
+    {
+        "table": "T003P",
+        "description": "Order Type Texts",
+        "columns": [
+            "AUART",   # Order type                  (join key -> AUFK.AUART)
+            "SPRAS",   # Language key
+            "TXT",     # Order type text
+        ],
+        "options_fn": lambda: _format_options(f"SPRAS = '{LANGUAGE}'"),
+        "primary_keys": ["SPRAS", "AUART"],
+    },
 ]
 
 
@@ -1504,7 +1549,7 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = [
 # -------------------------------------------------------------
 @dataclass
 class ExtractionConfig:
-    batch_size: int       = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "10000")))
+    batch_size: int       = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "100000")))
     max_buffer_width: int = field(default_factory=lambda: int(os.getenv("MAX_BUFFER_WIDTH", "480")))
     max_retries: int      = field(default_factory=lambda: int(os.getenv("MAX_RETRIES",      "3")))
     retry_delay_s: float  = field(default_factory=lambda: float(os.getenv("RETRY_DELAY_S",  "5")))
@@ -1512,8 +1557,9 @@ class ExtractionConfig:
     staging_schema: str   = field(default_factory=lambda: get_postgres_schema(SAP_SYSTEM))
 
     def __post_init__(self) -> None:
-        if self.batch_size > 10_000:
-            raise ValueError("batch_size should not exceed 10 000 for RFC stability.")
+        # >>> CHANGED (v1.1-B): 10,000 cap removed. ROWSKIPS paging is not
+        # order-stable (duplicate AND missing rows), so each table should be
+        # read in ONE call; keep windows small (orchestrator: 15 days).
         if self.max_buffer_width > 512:
             raise ValueError("max_buffer_width cannot exceed SAP RFC limit of 512.")
 
@@ -1766,6 +1812,7 @@ class BatchExtractor:
     def batches(self) -> Generator[List[List[Any]], None, None]:
         offset = 0
         total  = 0
+        n_batches = 0
 
         while True:
             batch = self._fetch_offset(offset)
@@ -1774,6 +1821,14 @@ class BatchExtractor:
                 break
 
             total  += len(batch)
+            n_batches += 1
+            if n_batches == 2:
+                # >>> CHANGED (v1.1-B): paging risk warning
+                self._log.warning(
+                    "[%s] Read in more than one batch (BATCH_SIZE=%d). ROWSKIPS "
+                    "paging can duplicate or drop rows - shorten the date window.",
+                    self._table, self._cfg.batch_size,
+                )
             offset += self._cfg.batch_size
             self._log.info(
                 "[%s] Fetched %d rows (running total: %d).",
@@ -1874,6 +1929,14 @@ class PostgresLoader:
         self._cursor.execute(ddl_create)
 
         # Truncate to wipe previous run data
+        # >>> CHANGED (v1.1-C): add any configured column missing from an existing
+        # table (new fields like AUTYP / STZHL / MEINH need no manual DDL).
+        self._cursor.execute(
+            f"ALTER TABLE {self._schema}.{stg_name} "
+            + ", ".join(f'ADD COLUMN IF NOT EXISTS "{c}" TEXT' for c in safe_cols)
+            + ";"
+        )
+
         self._cursor.execute(f"TRUNCATE TABLE {self._schema}.{stg_name};")
         self.conn.commit()
 

@@ -84,30 +84,29 @@
 # from __future__ import annotations
 
 # import os
-# import platform
-
-# # -------------------------------------------------------------
-# # PostgreSQL DLL handling (required for Python 3.8+ on Windows)
-# # Replace the path below with your actual PostgreSQL bin path.
-# # -------------------------------------------------------------
-# pg_bin_path = r"C:\Program Files\PostgreSQL\18\bin"
-
-# if platform.system() == "Windows":
-#     if os.path.exists(pg_bin_path):
-#         os.add_dll_directory(pg_bin_path)
-#     os.add_dll_directory(os.getcwd())
-
-# import logging
 # import sys
-# import time
-# from dataclasses import dataclass, field
-# from datetime import datetime
+
+# _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# for _p in (_THIS_DIR, os.path.dirname(_THIS_DIR), os.path.dirname(os.path.dirname(_THIS_DIR))):
+#     if _p not in sys.path:
+#         sys.path.append(_p)
+
+# # connections.py must be imported BEFORE pyrfc / psycopg2 (.env + DLL paths)
+# from connections import (  # noqa: E402
+#     get_postgres_connection,
+#     get_postgres_schema,
+#     get_sap_connection,
+# )
+
+# import logging  # noqa: E402
+# import time  # noqa: E402
+# from dataclasses import dataclass, field  # noqa: E402
+# from datetime import datetime  # noqa: E402
 # from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
-# import psycopg2
-# from psycopg2 import extras
-# from dotenv import load_dotenv
-# from pyrfc import (
+# import psycopg2  # noqa: E402
+# from psycopg2 import extras  # noqa: E402
+# from pyrfc import (  # noqa: E402
 #     ABAPApplicationError,
 #     ABAPRuntimeError,
 #     CommunicationError,
@@ -115,20 +114,7 @@
 #     LogonError,
 # )
 
-# # -------------------------------------------------------------
-# # RFC SDK registration  (must run before any pyrfc import use)
-# # -------------------------------------------------------------
-# load_dotenv()
-
-# RFC_SDK_PATH = os.getenv("RFC_SDK_PATH", r"D:\For ESS\nwrfc750P_18-70002755\nwrfcsdk\lib")
-# if os.path.isdir(RFC_SDK_PATH):
-#     if sys.platform == "win32":
-#         try:
-#             os.add_dll_directory(RFC_SDK_PATH)
-#         except AttributeError:
-#             os.environ["PATH"] = RFC_SDK_PATH + ";" + os.environ.get("PATH", "")
-#     else:
-#         os.environ["PATH"] = RFC_SDK_PATH + ":" + os.environ.get("PATH", "")
+# SAP_SYSTEM: str = "ECC"
 
 
 # # =============================================================
@@ -605,7 +591,7 @@
 #     max_retries: int      = field(default_factory=lambda: int(os.getenv("MAX_RETRIES",      "3")))
 #     retry_delay_s: float  = field(default_factory=lambda: float(os.getenv("RETRY_DELAY_S",  "5")))
 #     commit_every: int     = field(default_factory=lambda: int(os.getenv("COMMIT_EVERY",     "100000")))
-#     staging_schema: str   = field(default_factory=lambda: os.getenv("STAGING_SCHEMA_ECC",   "sap_stg_ecc"))
+#     staging_schema: str   = field(default_factory=lambda: get_postgres_schema(SAP_SYSTEM))
 
 #     def __post_init__(self) -> None:
 #         if self.batch_size > 10_000:
@@ -649,30 +635,12 @@
 # # =============================================================
 # # Environment / connection config
 # # =============================================================
-# def _require_env(key: str) -> str:
-#     val = os.getenv(key)
-#     if not val:
-#         raise EnvironmentError(f"Required env var '{key}' is missing or empty.")
-#     return val
-
-
-# def build_sap_config() -> Dict[str, str]:
-#     return {
-#         "user":   _require_env("SAP_USER"),
-#         "passwd": _require_env("SAP_PASSWORD"),
-#         "ashost": _require_env("SAP_ASHOST"),
-#         "sysnr":  _require_env("SAP_SYSNR"),
-#         "client": _require_env("SAP_CLIENT"),
-#         "lang":   os.getenv("SAP_LANG", "EN"),
-#     }
-
-
 # # =============================================================
 # # SAP connection wrapper
 # # =============================================================
 # class SAPConnection:
-#     def __init__(self, config: Dict[str, str], log: logging.Logger) -> None:
-#         self._cfg = config
+#     def __init__(self, system: str, log: logging.Logger) -> None:
+#         self._system   = system
 #         self._log = log
 #         self.conn: Optional[Connection] = None
 #         self._connect()
@@ -680,8 +648,8 @@
 #     def _connect(self) -> None:
 #         for attempt in range(1, 4):
 #             try:
-#                 self._log.info("Connecting to SAP (attempt %d/3)...", attempt)
-#                 self.conn = Connection(**self._cfg)
+#                 self._log.info("Connecting to SAP %s (attempt %d/3)...", self._system, attempt)
+#                 self.conn = get_sap_connection(self._system)
 #                 self._log.info("SAP connection established.")
 #                 return
 #             except LogonError:
@@ -956,12 +924,10 @@
 # class PostgresLoader:
 #     def __init__(
 #         self,
-#         cfg:    Dict[str, Any],
 #         schema: str,
 #         prefix: str,
 #         log:    logging.Logger,
 #     ) -> None:
-#         self._cfg    = cfg
 #         self._schema = schema
 #         self._prefix = prefix
 #         self._log    = log
@@ -971,7 +937,7 @@
 #     def connect(self) -> None:
 #         self._log.info("Connecting to PostgreSQL...")
 #         try:
-#             self.conn    = psycopg2.connect(**self._cfg)
+#             self.conn    = get_postgres_connection()
 #             self._cursor = self.conn.cursor()
 #             self._log.info("PostgreSQL connection established.")
 #         except Exception:
@@ -979,24 +945,30 @@
 #             raise
 
 #     def create_staging_table(self, sap_table: str, columns: List[str]) -> str:
-#         stg_name  = f"stg_sap_{self._prefix.lower()}_{sap_table.lower()}"
+#         stg_name  = f"stg_sap_iw29_{sap_table.lower()}"
 #         safe_cols = [c.replace("-", "_").replace("/", "_").lower() for c in columns]
 
 #         self._cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema};")
 
-#         col_defs = ",\n    ".join([f'"{c}" TEXT' for c in safe_cols])
-#         ddl = f"""
-#         DROP TABLE IF EXISTS {self._schema}.{stg_name};
-#         CREATE TABLE {self._schema}.{stg_name} (
+#         col_defs = ",\n            ".join([f'"{c}" TEXT' for c in safe_cols])
+
+#         # Create the table only if it doesn't already exist
+#         ddl_create = f"""
+#         CREATE TABLE IF NOT EXISTS {self._schema}.{stg_name} (
 #             {col_defs},
 #             load_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 #             extraction_id UUID DEFAULT gen_random_uuid()
 #         );
 #         """
-#         self._log.info("Creating staging table %s.%s...", self._schema, stg_name)
-#         self._cursor.execute(ddl)
+
+#         self._log.info("Preparing staging table %s.%s...", self._schema, stg_name)
+#         self._cursor.execute(ddl_create)
+
+#         # Truncate to wipe previous run data
+#         self._cursor.execute(f"TRUNCATE TABLE {self._schema}.{stg_name};")
 #         self.conn.commit()
-#         self._log.info("Staging table %s.%s created.", self._schema, stg_name)
+
+#         self._log.info("Staging table %s.%s truncated and ready.", self._schema, stg_name)
 #         return f'"{self._schema}"."{stg_name}"'
 
 #     def load_batch(
@@ -1108,22 +1080,14 @@
 #     log.info("=" * 60)
 
 #     try:
-#         cfg        = ExtractionConfig()
-#         sap_config = build_sap_config()
-#         pg_config  = {
-#             "host":     _require_env("PG_HOST"),
-#             "port":     os.getenv("PG_PORT", "5432"),
-#             "database": _require_env("PG_DATABASE"),
-#             "user":     _require_env("PG_USER"),
-#             "password": _require_env("PG_PASSWORD"),
-#         }
+#         cfg = ExtractionConfig()
 #     except (EnvironmentError, ValueError) as exc:
 #         log.critical("Configuration error: %s", exc)
 #         sys.exit(1)
 
 #     try:
-#         sap    = SAPConnection(sap_config, log)
-#         loader = PostgresLoader(pg_config, cfg.staging_schema, STAGING_PREFIX, log)
+#         sap    = SAPConnection(SAP_SYSTEM, log)
+#         loader = PostgresLoader(cfg.staging_schema, STAGING_PREFIX, log)
 #         loader.connect()
 #     except Exception:
 #         log.critical("Failed to establish connections -- aborting.")
@@ -1264,6 +1228,7 @@
 #         print("\nExtraction cancelled by user.")
 #         sys.exit(1)
 
+#new code as on 16-11-2026
 """
 SAP IW29 Display PM Notifications — Staging Extractor
 ======================================================
@@ -1344,7 +1309,24 @@ SysStatus assembly note:
   STRING_AGG them joined on OBJNR to reproduce the IW29 display.
 
 Author  : [Your Name]
-Version : 1.2.0
+Version : 1.3.0 (ECC)
+
+Change log
+----------
+1.1.0 (ECC)  Fixes ported from the validated SAP HANA extractors:
+  v1.1-A  WHERE builders: IN / OR groups wrapped in brackets, so
+          'AND INACT = ''' / 'SPRAS' / 'WRTTP' / 'STOKZ' apply to every
+          group, not only the last one (pitfall P1).
+  v1.1-B  BATCH_SIZE default 100,000, 10,000 cap removed, WARNING when a
+          table needs more than one RFC call (ROWSKIPS paging, pitfall P2).
+  v1.1-C  Loader adds missing configured columns to existing staging
+          tables (ADD COLUMN IF NOT EXISTS) before TRUNCATE.
+  v1.1-H  Commented-out copy of the old script removed.
+  v1.1-I  Default DATE_FROM/DATE_TO = 20261001-20261031 (the orchestrator
+          passes its own 15-day window).
+  IW29    Run summary also logs the number of linked orders (PMCO keys).
+  Query-side (not in this file): PMCO wrttp = '04' (was '4'), UGX x100,
+  JEST DISTINCT, downtime AUSZT converted from seconds to MAUEH.
 """
 
 from __future__ import annotations
@@ -1388,8 +1370,8 @@ SAP_SYSTEM: str = "ECC"
 # =============================================================
 
 # Notification date range applied to QMEL.QMDAT  (YYYYMMDD format)
-DATE_FROM: str = os.getenv("DATE_FROM", "20260101")
-DATE_TO:   str = os.getenv("DATE_TO",   "20260131")
+DATE_FROM: str = os.getenv("DATE_FROM", "20261001")
+DATE_TO:   str = os.getenv("DATE_TO",   "20261031")
 
 # Maintenance planning plant(s) — applied to QMEL.IWERK
 PLANTS: List[str] = ["1202"]
@@ -1474,7 +1456,7 @@ def _build_in_options(
     i = 0
 
     while i < len(sorted_vals):
-        prefix      = f"{field_name} IN (" if first_clause else f"OR {field_name} IN ("
+        prefix      = f"( {field_name} IN (" if first_clause else f"OR {field_name} IN ("
         max_content = 72 - len(prefix) - 1
         row_vals: List[str] = []
         row_len = 0
@@ -1490,6 +1472,10 @@ def _build_in_options(
 
         options.append({"TEXT": prefix + ",".join(row_vals) + ")"})
         first_clause = False
+
+    # >>> CHANGED (v1.1-A): close the group opened on the first row so the
+    # extra filter applies to EVERY IN group (AND binds tighter than OR).
+    options.append({"TEXT": ")"})
 
     if extra:
         options.append({"TEXT": f"AND {extra}"})
@@ -1852,7 +1838,7 @@ STAGING_TABLE_DEFS: List[Dict[str, Any]] = _build_staging_table_defs()
 # =============================================================
 @dataclass
 class ExtractionConfig:
-    batch_size: int       = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "10000")))
+    batch_size: int       = field(default_factory=lambda: int(os.getenv("BATCH_SIZE",       "100000")))
     max_buffer_width: int = field(default_factory=lambda: int(os.getenv("MAX_BUFFER_WIDTH", "480")))
     max_retries: int      = field(default_factory=lambda: int(os.getenv("MAX_RETRIES",      "3")))
     retry_delay_s: float  = field(default_factory=lambda: float(os.getenv("RETRY_DELAY_S",  "5")))
@@ -1860,8 +1846,9 @@ class ExtractionConfig:
     staging_schema: str   = field(default_factory=lambda: get_postgres_schema(SAP_SYSTEM))
 
     def __post_init__(self) -> None:
-        if self.batch_size > 10_000:
-            raise ValueError("batch_size should not exceed 10 000 for RFC stability.")
+        # >>> CHANGED (v1.1-B): 10,000 cap removed. ROWSKIPS paging is not
+        # order-stable (duplicate AND missing rows), so each table should be
+        # read in ONE call; keep windows small (orchestrator: 15 days).
         if self.max_buffer_width > 512:
             raise ValueError("max_buffer_width cannot exceed SAP RFC limit of 512.")
 
@@ -2121,6 +2108,7 @@ class BatchExtractor:
     def batches(self) -> Generator[List[List[Any]], None, None]:
         offset = 0
         total  = 0
+        n_batches = 0
 
         while True:
             batch = self._fetch_offset(offset)
@@ -2131,6 +2119,14 @@ class BatchExtractor:
                 break
 
             total  += len(batch)
+            n_batches += 1
+            if n_batches == 2:
+                # >>> CHANGED (v1.1-B): paging risk warning
+                self._log.warning(
+                    "[%s] Read in more than one batch (BATCH_SIZE=%d). ROWSKIPS "
+                    "paging can duplicate or drop rows - shorten the date window.",
+                    self._table, self._cfg.batch_size,
+                )
             offset += self._cfg.batch_size
             self._log.info(
                 "[%s] Fetched %d rows (running total: %d).",
@@ -2231,6 +2227,14 @@ class PostgresLoader:
         self._cursor.execute(ddl_create)
 
         # Truncate to wipe previous run data
+        # >>> CHANGED (v1.1-C): add any configured column missing from an existing
+        # table (new fields like AUTYP / STZHL / MEINH need no manual DDL).
+        self._cursor.execute(
+            f"ALTER TABLE {self._schema}.{stg_name} "
+            + ", ".join(f'ADD COLUMN IF NOT EXISTS "{c}" TEXT' for c in safe_cols)
+            + ";"
+        )
+
         self._cursor.execute(f"TRUNCATE TABLE {self._schema}.{stg_name};")
         self.conn.commit()
 
@@ -2387,6 +2391,7 @@ def main() -> None:
     log.info("    ILOAN : %d location assignments",  len(_ILOAN_SET))
     log.info("    EQUNR : %d equipment numbers",     len(_EQUNR_SET))
     log.info("    STAT  : %d active status codes",   len(_STAT_SET))
+    log.info("    AUFNR : %d linked orders (-> PMCO)", len(_AUFNR_SET))
     log.info("Succeeded (%d):", len(succeeded))
     for tbl, count in succeeded:
         log.info("    %-20s  %d rows", tbl, count)
